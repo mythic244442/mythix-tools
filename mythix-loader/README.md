@@ -7,9 +7,11 @@ when it starts a game) and starts the game's exe. The game's own steam_api
 then talks to your running Steam client, and Steam does the ownership check.
 Nothing in the game folder is changed or copied.
 
-Steam has to be running (in the same Wine/Proton prefix as the game). Without
-it, or for a game the account doesn't own, the game's Steam init fails just
-as it would anywhere else.
+The Steam client has to be running: the native Linux one. Under neutron (or
+Proton) the game reaches it through the prefix's `steam.exe` shim and
+lsteamclient, which neutron uses when `SteamAppId`/`SteamGameId` is a real app
+id and Steam is up. Without Steam, or for a game the account doesn't own, the
+game's Steam init fails just as it would anywhere else.
 
 ## Layout
 
@@ -37,8 +39,15 @@ mythix-loader --setup                      # check loader exes + Steam install
 `--json` prints a single result object on stdout (human output goes to
 stderr). The Mythix launcher uses it for profile creation.
 
-Profiles live in `~/.mythix/loader_profiles/<name>/`. Launch one with
-`<compat_tool>/neutron waitforexitandrun "<profile>/<stub>.exe" [game args...]`.
+Profiles live in `~/.mythix/loader_profiles/<name>/`. The Mythix launcher
+launches them itself. By hand:
+
+```sh
+SteamAppId=<appid> <compat_tool>/neutron waitforexitandrun "<profile>/<stub>.exe" [game args...]
+```
+
+`SteamAppId` matters here: without it neutron skips its `steam.exe` shim,
+which is what registers the Steam client for the game.
 
 ## mythix_loader.ini
 

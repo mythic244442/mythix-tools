@@ -1064,8 +1064,9 @@ def create_profile(game_dir, appid=None, target_exe=None, profile_name=None, dry
     log(f"Config:     {ini_path}")
     log(f"  Edit the ini to add extra DLLs, env vars, or tweak settings.")
     print()
-    log("To launch (Steam must be running in the same prefix):")
-    log(f"  <compat_tool>/neutron waitforexitandrun \"{stub_path}\" [game args...]")
+    log("To launch by hand (the Steam client must be running; SteamAppId makes")
+    log("neutron go through its steam.exe shim, which connects the game to Steam):")
+    log(f"  SteamAppId={appid} <compat_tool>/neutron waitforexitandrun \"{stub_path}\" [game args...]")
     print()
     return plan
 
