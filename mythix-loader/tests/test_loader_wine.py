@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -148,6 +149,27 @@ class LoaderUnderWineTests(unittest.TestCase):
         self.assertEqual(seen["SPAWN"], "ok", out)      # would be "failed 5" without BREAKAWAY_OK
         self.assertEqual(code, 3, out)
         self.assertFalse(os.path.exists(marker), out)   # it left the job, so not waited for
+
+    def test_wine_helpers_left_running_dont_hold_the_wait(self):
+        # A helper named like one of Wine's, in the prefix's Windows directory,
+        # still running long after the game exe exits.
+        drive_c = os.path.join(self.env["WINEPREFIX"], "drive_c")
+        if not os.path.isdir(drive_c):
+            subprocess.run([WINE, "wineboot", "-i"], env=self.env, check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        helper_dir = os.path.join(drive_c, "windows", "mythix-loader-test")
+        os.makedirs(helper_dir, exist_ok=True)
+        try:
+            shutil.copy(self.fakegame, os.path.join(helper_dir, "mscorsvw.exe"))
+            ini = self.launcher_ini(os.path.join(self.root, "helper.done"), 8000,
+                                    ";FAKE_SPAWN_EXE=C:\\windows\\mythix-loader-test\\mscorsvw.exe")
+            start = time.monotonic()
+            code, seen, out = self.run_loader(ini)
+            self.assertLess(time.monotonic() - start, 6, out)
+            self.assertIn("Only Wine helper processes are left", out)
+            self.assertEqual(code, 3, out)
+        finally:
+            shutil.rmtree(helper_dir, ignore_errors=True)
 
     def test_no_persist_returns_at_once(self):
         marker = os.path.join(self.root, "nopersist.done")

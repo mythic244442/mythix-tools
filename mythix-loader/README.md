@@ -72,6 +72,13 @@ and the like) and `CREATE_BREAKAWAY_FROM_JOB` children work as normal. When the
 exe exits while other processes are still running, the loader lists them. If
 one never exits (a tray helper, say), set `WaitForChildren=0`.
 
+Wine's own helpers that a game can start (`dllhost.exe`, `conhost.exe`,
+`explorer.exe` and similar, from the Windows directory) don't keep the loader
+waiting once the game exe has exited; `dllhost.exe` would otherwise never let
+it finish. They're left running, not killed. Following child processes needs
+Wine 6.9 or newer (any current Proton); on older Wine the loader says so and
+waits for the exe only.
+
 The ini is UTF-8 (a BOM is fine; UTF-16 and legacy ANSI files also load).
 `/home/...` paths work under Wine. Arguments given to the stub are added after
 `ExeCommandLine`, apart from the loader's own `--ini <path>` and `--debug`.

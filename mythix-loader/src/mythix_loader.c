@@ -397,9 +397,29 @@ static int append_arg(wchar_t *buf, size_t cap, const wchar_t *arg) {
 typedef struct {
     HANDLE job;
     HANDLE port;
-    DWORD  pids[256];               /* live processes, for the waiting message */
+    DWORD  pids[256];               /* live processes, from the job's messages */
     int    n_pids;
+    int    pids_overflowed;         /* more than fit: the list is incomplete */
 } ProcessTree;
+
+/* Wine before 6.9 has no nested jobs: a game that puts its own children in a
+ * job (Chromium/CEF do, and kill the child if that fails) would break inside
+ * ours. Always true on Windows. */
+static int jobs_can_nest(void) {
+    typedef const char *(CDECL *wine_get_version_fn)(void);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    wine_get_version_fn get_version = ntdll
+        ? (wine_get_version_fn)(void (*)(void))GetProcAddress(ntdll, "wine_get_version")
+        : NULL;
+    const char *v = get_version ? get_version() : NULL;
+    int major = 0, minor = 0;
+    if (!v || sscanf(v, "%d.%d", &major, &minor) < 1) return 1;
+    dbg(L"Running on Wine %hs", v);
+    if (major > 6 || (major == 6 && minor >= 9)) return 1;
+    mlog(L"Wine %hs can't follow the processes a game starts (needs 6.9 or newer); "
+         L"waiting for the exe only", v);
+    return 0;
+}
 
 static void tree_close(ProcessTree *t) {
     if (t->port) CloseHandle(t->port);
@@ -408,6 +428,7 @@ static void tree_close(ProcessTree *t) {
 }
 
 static int tree_open(ProcessTree *t) {
+    if (!jobs_can_nest()) return 0;
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
     JOBOBJECT_ASSOCIATE_COMPLETION_PORT acp;
     ZeroMemory(&limits, sizeof(limits));
@@ -428,11 +449,13 @@ static int tree_open(ProcessTree *t) {
     return 0;
 }
 
-/* Processes still in the job, or -1 if the job can't be queried. */
+/* Processes still in the job, or -1 if the job can't tell. Wine 2.7-5.10
+ * answer with all zeros; a real count includes the game, so its total is at
+ * least 1. */
 static long tree_active(const ProcessTree *t) {
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info;
     if (!QueryInformationJobObject(t->job, JobObjectBasicAccountingInformation,
-                                   &info, sizeof(info), NULL))
+                                   &info, sizeof(info), NULL) || info.TotalProcesses == 0)
         return -1;
     return (long)info.ActiveProcesses;
 }
@@ -456,16 +479,53 @@ static void tree_track(ProcessTree *t, DWORD pid, int alive) {
             return;
         }
     }
-    if (alive && t->n_pids < (int)ARRAYSIZE(t->pids)) t->pids[t->n_pids++] = pid;
+    if (!alive) return;
+    if (t->n_pids < (int)ARRAYSIZE(t->pids)) t->pids[t->n_pids++] = pid;
+    else t->pids_overflowed = 1;
 }
 
-/* Returns once every process in the job has exited. */
+/* Wine's own helpers, which a game can start without being part of it. Once
+ * the game exe has exited, these (from the Windows directory) don't keep the
+ * loader waiting: dllhost.exe, Wine's COM surrogate, never exits on its own.
+ * They are left running, not killed. */
+static const wchar_t *const WINE_HELPERS[] = {
+    L"conhost.exe", L"dllhost.exe", L"explorer.exe", L"mscorsvw.exe",
+    L"plugplay.exe", L"rpcss.exe", L"services.exe", L"svchost.exe",
+    L"tabtip.exe", L"winebrowser.exe", L"wineboot.exe", L"winedbg.exe",
+    L"winedevice.exe", L"winemenubuilder.exe",
+};
+
+static int is_wine_helper(const wchar_t *image) {
+    wchar_t windir[MAX_PATH_W];
+    UINT n = GetSystemWindowsDirectoryW(windir, MAX_PATH_W - 1);
+    if (n == 0 || n >= MAX_PATH_W - 1) return 0;
+    if (windir[n - 1] != L'\\') wcscpy(windir + n++, L"\\");
+    if (_wcsnicmp(image, windir, n) != 0) return 0;
+    const wchar_t *name = wcsrchr(image, L'\\');
+    name = name ? name + 1 : image;
+    for (size_t i = 0; i < ARRAYSIZE(WINE_HELPERS); i++)
+        if (_wcsicmp(name, WINE_HELPERS[i]) == 0) return 1;
+    return 0;
+}
+
+/* True when every process left in the job is a Wine helper. */
+static int only_helpers_left(const ProcessTree *t) {
+    if (t->pids_overflowed || t->n_pids == 0) return 0;
+    for (int i = 0; i < t->n_pids; i++)
+        if (!is_wine_helper(process_image(t->pids[i]))) return 0;
+    return 1;
+}
+
+/* Returns once every process in the job has exited, or only Wine helpers
+ * are left (for two seconds) after the game exe has gone. */
 static void tree_wait(ProcessTree *t, const PROCESS_INFORMATION *pi) {
     long live = 0;                  /* processes in the job, from its messages */
+    int exe_gone = 0;
+    DWORD helpers_since = 0;        /* tick count when only helpers were left */
     for (;;) {
-        DWORD msg;
-        ULONG_PTR key;
-        LPOVERLAPPED ov;
+        DWORD msg = 0;
+        ULONG_PTR key = 0;
+        LPOVERLAPPED ov = NULL;
         if (!GetQueuedCompletionStatus(t->port, &msg, &key, &ov, 1000)) {
             /* Job messages aren't guaranteed to arrive, so once a second
              * also check the count directly. If the job can't tell us, fall
@@ -476,9 +536,10 @@ static void tree_wait(ProcessTree *t, const PROCESS_INFORMATION *pi) {
                 WaitForSingleObject(pi->hProcess, INFINITE);
                 return;
             }
+            msg = 0;                    /* fall through to the helper check */
+        } else if (key != (ULONG_PTR)t->job) {
             continue;
         }
-        if (key != (ULONG_PTR)t->job) continue;
         DWORD pid = (DWORD)(ULONG_PTR)ov;
         switch (msg) {
         case JOB_OBJECT_MSG_NEW_PROCESS:
@@ -493,15 +554,34 @@ static void tree_wait(ProcessTree *t, const PROCESS_INFORMATION *pi) {
             tree_track(t, pid, 0);
             if (pid != pi->dwProcessId) {
                 dbg(L"Process %lu exited: %ls", pid, process_image(pid));
-            } else if (live > 0) {
+                break;
+            }
+            exe_gone = 1;
+            if (live > 0 && !only_helpers_left(t)) {
                 /* Say what is keeping the loader around, in case it never ends. */
                 mlog(L"Game exe exited; still waiting for %ld process(es) it started:", live);
-                for (int i = 0; i < t->n_pids; i++)
-                    mlog(L"  PID %lu: %ls", t->pids[i], process_image(t->pids[i]));
+                for (int i = 0; i < t->n_pids; i++) {
+                    const wchar_t *img = process_image(t->pids[i]);
+                    mlog(L"  PID %lu: %ls%ls", t->pids[i], img,
+                         is_wine_helper(img) ? L" (Wine helper, not waited for)" : L"");
+                }
                 mlog(L"(WaitForChildren=0 in the ini makes Persist wait for the exe only)");
             }
             break;
         case JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO:
+            return;
+        }
+
+        if (!exe_gone) continue;
+        if (!only_helpers_left(t)) {
+            helpers_since = 0;
+        } else if (!helpers_since) {
+            helpers_since = GetTickCount() | 1;
+        } else if (GetTickCount() - helpers_since >= 2000) {
+            for (int i = 0; i < t->n_pids; i++)
+                dbg(L"Not waiting for Wine helper PID %lu: %ls",
+                    t->pids[i], process_image(t->pids[i]));
+            mlog(L"Only Wine helper processes are left; done waiting");
             return;
         }
     }

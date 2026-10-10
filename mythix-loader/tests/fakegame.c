@@ -4,7 +4,8 @@
  * Launcher mode, for the Persist tests: with FAKE_SPAWN=1 it starts a copy
  * of itself as the "real game" and exits at once with 3, like a launcher exe.
  * FAKE_CHILD_JOB=1 puts that child in a job of its own (as Chromium/CEF do),
- * FAKE_BREAKAWAY=1 starts it with CREATE_BREAKAWAY_FROM_JOB. The child sleeps
+ * FAKE_BREAKAWAY=1 starts it with CREATE_BREAKAWAY_FROM_JOB, FAKE_SPAWN_EXE
+ * names a different exe to start instead of itself. The child sleeps
  * FAKE_SLEEP_MS, then creates the file named by FAKE_MARKER and exits with 7. */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -24,7 +25,8 @@ static int env_on(const wchar_t *name) {
 
 static int spawn_real_game(void) {
     wchar_t self[4096];
-    GetModuleFileNameW(NULL, self, 4096);
+    if (!GetEnvironmentVariableW(L"FAKE_SPAWN_EXE", self, 4096))
+        GetModuleFileNameW(NULL, self, 4096);
     SetEnvironmentVariableW(L"FAKE_SPAWN", NULL);     /* the child is the game */
 
     DWORD flags = env_on(L"FAKE_BREAKAWAY") ? CREATE_BREAKAWAY_FROM_JOB : 0;
