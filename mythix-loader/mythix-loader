@@ -108,6 +108,11 @@ def error(msg):
     sys.exit(1)
 
 
+def _slug(text):
+    """Lowercase, spaces to dashes, only a-z 0-9 - _ kept ("" if nothing is left)."""
+    return re.sub(r"[^a-z0-9_-]", "", (text or "").lower().replace(" ", "-"))
+
+
 # ── VDF / ACF parsing ──────────────────────────────────────────────────────
 # Steam's libraryfolders.vdf and appmanifest_*.acf use the same text keyvalues
 # format: quoted tokens, { } maps. Minimal, dependency-free parser.
@@ -198,17 +203,23 @@ def steam_library_entries(steam_dir):
 
     `apps` is the set of appids that library's entry in libraryfolders.vdf
     registers — i.e. which library Steam considers the real home of each app.
+    Paths are deduped by their real location: ~/.steam/steam is usually a
+    symlink to ~/.local/share/Steam, which libraryfolders.vdf lists again.
+    The path is kept as libraryfolders.vdf spells it.
     """
     entries = []
     index = {}
 
-    def add(p, apps):
+    def add(p, apps, listed=False):
         p = os.path.normpath(p)
-        if p in index:
-            index[p]["apps"] |= set(apps)
+        key = os.path.realpath(p)
+        if key in index:
+            index[key]["apps"] |= set(apps)
+            if listed:
+                index[key]["path"] = p
             return
         e = {"path": p, "apps": set(apps)}
-        index[p] = e
+        index[key] = e
         entries.append(e)
 
     add(steam_dir, set())
@@ -221,9 +232,9 @@ def steam_library_entries(steam_dir):
             for key, val in folders.items():
                 if isinstance(val, dict) and val.get("path"):
                     apps = val.get("apps")
-                    add(val["path"], set(apps.keys()) if isinstance(apps, dict) else set())
+                    add(val["path"], set(apps.keys()) if isinstance(apps, dict) else set(), listed=True)
                 elif isinstance(val, str) and key.isdigit():  # legacy format
-                    add(val, set())
+                    add(val, set(), listed=True)
         except Exception as e:
             warn(f"could not parse libraryfolders.vdf: {e}")
     return entries
@@ -303,20 +314,30 @@ def is_tool_app(app):
 
 
 def resolve_appid_from_library(game_dir, apps=None):
-    """If game_dir maps to an installed app's directory, return (appid, name)."""
+    """If game_dir maps to an installed app's directory, return (appid, name).
+
+    Paths are compared with symlinks resolved, so ~/.steam/steam/... matches an
+    install the library lists under ~/.local/share/Steam/... A folder above
+    several installs (say steamapps/common) is ambiguous and matches nothing.
+    """
     if apps is None:
         apps = installed_apps()
-    target = os.path.normpath(os.path.abspath(game_dir))
+    target = os.path.realpath(game_dir)
+    insts = [(os.path.realpath(a["installdir"]), a) for a in apps if a["installdir"]]
     # exact install-dir match first
-    for app in apps:
-        inst = os.path.normpath(app["installdir"]) if app["installdir"] else ""
-        if inst and inst == target:
+    for inst, app in insts:
+        if inst == target:
             return app["appid"], app["name"]
-    # then containment either way (exe subfolder, or dir above the install)
-    for app in apps:
-        inst = os.path.normpath(app["installdir"]) if app["installdir"] else ""
-        if inst and (target.startswith(inst + os.sep) or inst.startswith(target + os.sep)):
+    # then a subfolder of an install (e.g. where the exe lives)
+    for inst, app in insts:
+        if target.startswith(inst + os.sep):
             return app["appid"], app["name"]
+    # then a folder above an install, but only if exactly one install is below it
+    below = [app for inst, app in insts if inst.startswith(target + os.sep)]
+    if len(below) == 1:
+        return below[0]["appid"], below[0]["name"]
+    if below:
+        warn(f"{game_dir} contains {len(below)} installed titles — pass the game's own folder")
     return None, None
 
 
@@ -367,7 +388,7 @@ class AppInfo:
         m = {}
         while True:
             t = d[off]; off += 1
-            if t == 0x08:
+            if t in (0x08, 0x0B):                             # end / alternate end
                 return m, off
             key, off = self._key(off)
             if t == 0x00:
@@ -378,10 +399,12 @@ class AppInfo:
                 v, = struct.unpack_from("<i", d, off); off += 4
             elif t == 0x03:
                 v, = struct.unpack_from("<f", d, off); off += 4
-            elif t == 0x04:                                   # color / pointer
+            elif t in (0x04, 0x06):                           # pointer / color
                 v, = struct.unpack_from("<i", d, off); off += 4
             elif t == 0x07:
                 v, = struct.unpack_from("<Q", d, off); off += 8
+            elif t == 0x0A:
+                v, = struct.unpack_from("<q", d, off); off += 8
             else:
                 raise ValueError("unknown vdf type 0x%02x at %d" % (t, off - 1))
             m[key] = v
@@ -497,8 +520,9 @@ def steam_args_for(entries, executable):
     return out
 
 
-def resolve_ci(base, rel):
-    """Resolve rel (may use \\ or /) under base, case-insensitively. File only."""
+def resolve_ci(base, rel, want_dir=False):
+    """Resolve rel (may use \\ or /) under base, case-insensitively.
+    Returns an existing file (or folder, with want_dir), else None."""
     rel = rel.replace("\\", "/")
     cur = base
     for part in [p for p in rel.split("/") if p and p != "."]:
@@ -515,23 +539,29 @@ def resolve_ci(base, rel):
         if match is None:
             return None
         cur = os.path.join(cur, match)
-    return cur if os.path.isfile(cur) else None
+    found = os.path.isdir(cur) if want_dir else os.path.isfile(cur)
+    return cur if found else None
 
 
 def get_pe_arch(exe_path):
-    with open(exe_path, "rb") as f:
-        if f.read(2) != b"MZ":
-            return None
-        f.seek(0x3C)
-        pe_offset = struct.unpack("<I", f.read(4))[0]
-        f.seek(pe_offset)
-        if f.read(4) != b"PE\x00\x00":
-            return None
-        machine = struct.unpack("<H", f.read(2))[0]
-        if machine == 0x14C:
-            return 32
-        elif machine == 0x8664:
-            return 64
+    """32 or 64 for an x86/x64 PE file; None otherwise, including for files that
+    are unreadable or cut short (a stray tiny .exe used to crash the scan)."""
+    try:
+        with open(exe_path, "rb") as f:
+            if f.read(2) != b"MZ":
+                return None
+            f.seek(0x3C)
+            pe_offset = struct.unpack("<I", f.read(4))[0]
+            f.seek(pe_offset)
+            if f.read(4) != b"PE\x00\x00":
+                return None
+            machine = struct.unpack("<H", f.read(2))[0]
+    except (OSError, struct.error):
+        return None
+    if machine == 0x14C:
+        return 32
+    if machine == 0x8664:
+        return 64
     return None
 
 
@@ -564,29 +594,31 @@ def get_pe_imports(exe_path):
                 f.read(8)
                 vsize, vaddr, rawsize, rawptr = struct.unpack("<IIII", f.read(16))
                 sections.append((vaddr, rawsize, rawptr))
-            for vaddr, rawsize, rawptr in sections:
-                if vaddr <= import_rva < vaddr + rawsize:
-                    file_offset = rawptr + (import_rva - vaddr)
-                    f.seek(file_offset)
-                    while True:
-                        entry = f.read(20)
-                        if len(entry) < 20:
-                            break
-                        _, _, _, name_rva, _ = struct.unpack("<IIIII", entry)
-                        if name_rva == 0:
-                            break
-                        name_offset = rawptr + (name_rva - vaddr)
-                        pos = f.tell()
-                        f.seek(name_offset)
-                        dll_name = b""
-                        while True:
-                            c = f.read(1)
-                            if c == b"\x00" or not c:
-                                break
-                            dll_name += c
-                        f.seek(pos)
-                        imports.append(dll_name.decode("ascii", errors="replace"))
+
+            # The descriptor table and the DLL names can sit in different sections.
+            def rva_to_offset(rva):
+                for vaddr, rawsize, rawptr in sections:
+                    if vaddr <= rva < vaddr + rawsize:
+                        return rawptr + (rva - vaddr)
+                return None
+
+            table = rva_to_offset(import_rva)
+            if table is None:
+                return imports
+            for i in range(4096):                 # bound the walk on corrupt files
+                f.seek(table + i * 20)
+                entry = f.read(20)
+                if len(entry) < 20:
                     break
+                _, _, _, name_rva, _ = struct.unpack("<IIIII", entry)
+                if name_rva == 0:
+                    break
+                name_offset = rva_to_offset(name_rva)
+                if name_offset is None:
+                    continue
+                f.seek(name_offset)
+                dll_name = f.read(256).split(b"\x00", 1)[0]
+                imports.append(dll_name.decode("ascii", errors="replace"))
     except Exception:
         pass
     return imports
@@ -789,9 +821,18 @@ def create_profile(game_dir, appid=None, target_exe=None, profile_name=None, dry
     launch_args = ""
     launch_source = "heuristic"
     steam_options = []
+    inst_dir = matched["installdir"] if (matched and matched["installdir"]) else game_dir
+    entries = []
+    if appid and appid.isdigit():
+        ai = find_appinfo()
+        entries = launch_options(ai.app(int(appid)) if ai else None)
+    ranked = rank_windows_launches(entries)
+
     if target_exe:
-        target_abs = os.path.abspath(target_exe)
-        match = next((r for r in results if os.path.abspath(r["path"]) == target_abs), None)
+        # A relative --exe is looked up under the game dir first, then the cwd.
+        wanted = [target_exe] if os.path.isabs(target_exe) else [os.path.join(game_dir, target_exe), target_exe]
+        wanted = {os.path.realpath(p) for p in wanted}
+        match = next((r for r in results if os.path.realpath(r["path"]) in wanted), None)
         if not match:
             match = next((r for r in results if r["name"].lower() == os.path.basename(target_exe).lower()), None)
         if match:
@@ -800,32 +841,48 @@ def create_profile(game_dir, appid=None, target_exe=None, profile_name=None, dry
         else:
             error(f"Specified exe not found: {target_exe}")
     else:
-        if appid and appid.isdigit():
-            inst = matched["installdir"] if (matched and matched["installdir"]) else game_dir
-            ai = find_appinfo()
-            app_meta = ai.app(int(appid)) if ai else None
-            entries = launch_options(app_meta)
-            for opt in rank_windows_launches(entries):
-                cand = resolve_ci(inst, opt["executable"])
-                if cand:
-                    main_exe = {
-                        "path": cand,
-                        "name": os.path.basename(cand),
-                        "arch": get_pe_arch(cand),
-                        "has_steam": False,
-                        "size_mb": os.path.getsize(cand) / (1024 * 1024),
-                    }
-                    launch_source = "appinfo"
-                    steam_options = steam_args_for(entries, opt["executable"])
-                    log(f"Launch target from Steam app config: {opt['executable']}")
-                    if steam_options:
-                        log(f"  Steam's launch options for it: {' | '.join(steam_options)}")
-                        log("  (not applied — add one to the game's launch args if you want it)")
-                    break
+        for opt in ranked:
+            cand = resolve_ci(inst_dir, opt["executable"])
+            if cand:
+                main_exe = {
+                    "path": cand,
+                    "name": os.path.basename(cand),
+                    "arch": get_pe_arch(cand),
+                    "has_steam": False,
+                    "size_mb": os.path.getsize(cand) / (1024 * 1024),
+                }
+                launch_source = "appinfo"
+                log(f"Launch target from Steam app config: {opt['executable']}")
+                break
         if main_exe is None:
             main_exe = pick_main_exe(results, game_dir)
     if not main_exe:
         error("Could not identify a game executable")
+
+    # Steam's own launch entry for the chosen exe (however it was chosen) gives
+    # the working directory, and its argument variants are listed for reference.
+    exe_real = os.path.realpath(main_exe["path"])
+    exe_entry = None
+    for opt in ranked:
+        cand = resolve_ci(inst_dir, opt["executable"])
+        if cand and os.path.realpath(cand) == exe_real:
+            exe_entry = opt
+            break
+    # The game runs in Steam's workingdir for the entry if it sets one, else in
+    # the exe's own folder — never in the profile dir, so games that load files
+    # relative to their working directory find them.
+    run_dir = os.path.dirname(main_exe["path"])
+    if exe_entry:
+        steam_options = steam_args_for(entries, exe_entry["executable"])
+        if steam_options:
+            log(f"  Steam's launch options for it: {' | '.join(steam_options)}")
+            log("  (not applied — add one to the game's launch args if you want it)")
+        if exe_entry["workingdir"]:
+            wd = resolve_ci(inst_dir, exe_entry["workingdir"], want_dir=True)
+            if wd:
+                run_dir = wd
+            else:
+                warn(f"Steam's working dir '{exe_entry['workingdir']}' not found — using the exe's folder")
 
     try:
         rel = os.path.relpath(main_exe["path"], game_dir)
@@ -834,6 +891,7 @@ def create_profile(game_dir, appid=None, target_exe=None, profile_name=None, dry
     except ValueError:
         rel = main_exe["path"]
     log(f"Main exe: {rel}")
+    log(f"Run dir:  {run_dir}")
     arch = main_exe["arch"] or 64
     print()
 
@@ -862,17 +920,21 @@ def create_profile(game_dir, appid=None, target_exe=None, profile_name=None, dry
     print()
 
     # Profile name is always sanitized (also when given via --name) so the
-    # profile dir can never land outside ~/.mythix/loader_profiles/.
-    if not profile_name:
-        profile_name = game_name or os.path.basename(os.path.normpath(game_dir))
-    profile_name = re.sub(r"[^a-z0-9_-]", "", profile_name.lower().replace(" ", "-"))
-    if not profile_name:
-        error("Could not derive a profile name — pass --name")
+    # profile dir can never land outside ~/.mythix/loader_profiles/. A title
+    # with no ASCII letters (e.g. a Japanese name) falls back to the folder
+    # name, then to the appid.
+    if profile_name:
+        profile_name = _slug(profile_name)
+        if not profile_name:
+            error("--name needs at least one of a-z, 0-9, - or _")
+    else:
+        profile_name = (_slug(game_name) or _slug(os.path.basename(os.path.normpath(game_dir)))
+                        or (f"app-{appid}" if appid != "0" else ""))
+        if not profile_name:
+            error("Could not derive a profile name — pass --name")
 
     profile_dir = os.path.join(PROFILES_DIR, profile_name)
-    stub_name = os.path.splitext(main_exe["name"])[0].lower().replace(" ", "-")
-    stub_name = re.sub(r"[^a-z0-9_-]", "", stub_name) + ".exe"
-    inst_dir = matched["installdir"] if (matched and matched["installdir"]) else game_dir
+    stub_name = (_slug(os.path.splitext(main_exe["name"])[0]) or "game") + ".exe"
 
     plan = {
         "ok": True,
@@ -881,6 +943,7 @@ def create_profile(game_dir, appid=None, target_exe=None, profile_name=None, dry
         "name": game_name or os.path.basename(os.path.normpath(game_dir)),
         "game_dir": inst_dir,
         "exe": main_exe["path"],
+        "run_dir": run_dir,
         "args": launch_args,
         "launch_options": steam_options,
         "arch": arch,
@@ -951,7 +1014,8 @@ def create_profile(game_dir, appid=None, target_exe=None, profile_name=None, dry
         "# Generated by mythix-loader",
         "[MythixLoader]",
         f"Exe={main_exe['path']}",
-        f"ExeRunDir={profile_dir}",
+        "# Working directory for the game: Steam's for this exe, else the exe's folder.",
+        f"ExeRunDir={run_dir}",
         "# Arguments always passed to the game. Arguments given to the loader itself",
         "# (e.g. per-game launch args from the Mythix launcher) are added after these.",
         f"ExeCommandLine={launch_args}",
@@ -961,7 +1025,7 @@ def create_profile(game_dir, appid=None, target_exe=None, profile_name=None, dry
     ini_lines += [
         f"AppId={appid}",
         "",
-        "# Extra DLLs to load (semicolon-separated paths)",
+        "# Extra DLLs for the loader process itself, not the game (semicolon-separated)",
         "ExtraDlls=",
         "",
         "# Extra environment variables (KEY=VAL;KEY2=VAL2)",
@@ -974,7 +1038,7 @@ def create_profile(game_dir, appid=None, target_exe=None, profile_name=None, dry
         "Debug=0",
     ]
     ini_path = os.path.join(profile_dir, "mythix_loader.ini")
-    with open(ini_path, "w") as f:
+    with open(ini_path, "w", encoding="utf-8") as f:   # the loader reads UTF-8
         f.write("\n".join(ini_lines) + "\n")
 
     print()
@@ -988,6 +1052,7 @@ def create_profile(game_dir, appid=None, target_exe=None, profile_name=None, dry
     log(f"AppID:      {appid}")
     log(f"Arch:       {arch}-bit")
     log(f"Main exe:   {main_exe['name']}")
+    log(f"Run dir:    {run_dir}")
     if steam_options:
         log(f"Steam opts: {' | '.join(steam_options)}  (not baked in — pass one as a launch arg)")
     log(f"Profile:    {profile_dir}")
@@ -1101,7 +1166,7 @@ def list_profiles():
         appid = "?"
         exe_name = "?"
         if os.path.isfile(ini):
-            with open(ini) as f:
+            with open(ini, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     s = line.strip()
                     if s.startswith("Exe="):
@@ -1216,6 +1281,10 @@ Examples:
     game_dir = os.path.abspath(args.game_dir)
     if not os.path.isdir(game_dir):
         error(f"Not a directory: {game_dir}")
+    if args.appid is not None:
+        args.appid = args.appid.strip()
+        if not args.appid.isdigit():
+            error(f"--appid must be a number, got '{args.appid}'")
 
     if JSON_MODE:
         # Human-readable output goes to stderr; stdout carries only the result.
@@ -1238,7 +1307,7 @@ Examples:
     if args.dry_run:
         print()
         log("Dry run — nothing was written:")
-        for key in ("name", "appid", "exe", "launch_options", "launch_source",
+        for key in ("name", "appid", "exe", "run_dir", "launch_options", "launch_source",
                     "profile_dir", "stub_path", "steam_prefix"):
             log(f"  {key:<13} {plan.get(key)}")
         print()
