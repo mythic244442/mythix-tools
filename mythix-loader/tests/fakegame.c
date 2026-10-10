@@ -1,12 +1,18 @@
 /* Stand-in for a game in the loader tests: prints its working directory,
- * arguments and Steam-related environment as UTF-8, then exits with 7.
+ * arguments, Steam-related environment and whether it runs in a job object
+ * (IN_JOB=0/1) as UTF-8, then exits with 7.
  *
  * Launcher mode, for the Persist tests: with FAKE_SPAWN=1 it starts a copy
  * of itself as the "real game" and exits at once with 3, like a launcher exe.
  * FAKE_CHILD_JOB=1 puts that child in a job of its own (as Chromium/CEF do),
  * FAKE_BREAKAWAY=1 starts it with CREATE_BREAKAWAY_FROM_JOB, FAKE_SPAWN_EXE
  * names a different exe to start instead of itself. The child sleeps
- * FAKE_SLEEP_MS, then creates the file named by FAKE_MARKER and exits with 7. */
+ * FAKE_SLEEP_MS, then creates the file named by FAKE_MARKER and exits with 7.
+ *
+ * Chain mode: FAKE_CHAIN="0,2000,6000" makes a chain of processes, each
+ * starting the next and then sleeping its own number of milliseconds:
+ * launcher (exits at once), real game (2 s), a helper it leaves behind (6 s).
+ * The last one creates FAKE_MARKER. */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
@@ -23,23 +29,15 @@ static int env_on(const wchar_t *name) {
     return GetEnvironmentVariableW(name, v, 8) && v[0] == L'1';
 }
 
-static int spawn_real_game(void) {
-    wchar_t self[4096];
-    if (!GetEnvironmentVariableW(L"FAKE_SPAWN_EXE", self, 4096))
-        GetModuleFileNameW(NULL, self, 4096);
-    SetEnvironmentVariableW(L"FAKE_SPAWN", NULL);     /* the child is the game */
-
-    DWORD flags = env_on(L"FAKE_BREAKAWAY") ? CREATE_BREAKAWAY_FROM_JOB : 0;
-    int own_job = env_on(L"FAKE_CHILD_JOB");
-    if (own_job) flags |= CREATE_SUSPENDED;
-
+static int start_child(const wchar_t *exe, DWORD flags, int own_job) {
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
-    if (!CreateProcessW(self, NULL, NULL, NULL, FALSE, flags, NULL, NULL, &si, &pi)) {
+    if (own_job) flags |= CREATE_SUSPENDED;
+    if (!CreateProcessW(exe, NULL, NULL, NULL, FALSE, flags, NULL, NULL, &si, &pi)) {
         printf("SPAWN=failed %lu\n", GetLastError());
-        return 1;
+        return 0;
     }
     if (own_job) {
         HANDLE job = CreateJobObjectW(NULL, NULL);
@@ -51,7 +49,39 @@ static int spawn_real_game(void) {
     fflush(stdout);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
-    return 3;
+    return 1;
+}
+
+static void finish(void) {
+    wchar_t buf[4096];
+    if (GetEnvironmentVariableW(L"FAKE_MARKER", buf, 4096)) {
+        HANDLE h = CreateFileW(buf, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    }
+}
+
+/* FAKE_CHAIN: start the next link (FAKE_LEVEL + 1), then sleep this link's time. */
+static int run_chain(const wchar_t *chain) {
+    wchar_t buf[64], self[4096];
+    int level = GetEnvironmentVariableW(L"FAKE_LEVEL", buf, 64) ? _wtoi(buf) : 0;
+    DWORD sleeps[16];
+    int n = 0;
+    for (const wchar_t *p = chain; *p && n < 16; ) {
+        sleeps[n++] = (DWORD)_wtoi(p);
+        while (*p && *p != L',') p++;
+        if (*p == L',') p++;
+    }
+    if (level + 1 < n) {
+        GetModuleFileNameW(NULL, self, 4096);
+        _snwprintf(buf, 64, L"%d", level + 1);
+        SetEnvironmentVariableW(L"FAKE_LEVEL", buf);
+        start_child(self, 0, 0);
+    }
+    printf("LEVEL%d=started\n", level);
+    fflush(stdout);
+    if (level < n) Sleep(sleeps[level]);
+    if (level + 1 >= n) finish();
+    return level == 0 ? 3 : 7;
 }
 
 int wmain(int argc, wchar_t **argv) {
@@ -70,14 +100,23 @@ int wmain(int argc, wchar_t **argv) {
         if (GetEnvironmentVariableW(vars[i], buf, 4096)) put(label, buf);
         else printf("%s=<unset>\n", label);
     }
+    BOOL in_job = FALSE;
+    IsProcessInJob(GetCurrentProcess(), NULL, &in_job);
+    printf("IN_JOB=%d\n", in_job ? 1 : 0);
     fflush(stdout);
 
-    if (env_on(L"FAKE_SPAWN")) return spawn_real_game();
+    if (GetEnvironmentVariableW(L"FAKE_CHAIN", buf, 4096)) return run_chain(buf);
+
+    if (env_on(L"FAKE_SPAWN")) {
+        wchar_t exe[4096];
+        if (!GetEnvironmentVariableW(L"FAKE_SPAWN_EXE", exe, 4096))
+            GetModuleFileNameW(NULL, exe, 4096);
+        SetEnvironmentVariableW(L"FAKE_SPAWN", NULL);     /* the child is the game */
+        return start_child(exe, env_on(L"FAKE_BREAKAWAY") ? CREATE_BREAKAWAY_FROM_JOB : 0,
+                           env_on(L"FAKE_CHILD_JOB")) ? 3 : 1;
+    }
 
     if (GetEnvironmentVariableW(L"FAKE_SLEEP_MS", buf, 4096)) Sleep((DWORD)_wtoi(buf));
-    if (GetEnvironmentVariableW(L"FAKE_MARKER", buf, 4096)) {
-        HANDLE h = CreateFileW(buf, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-    }
+    finish();
     return 7;
 }

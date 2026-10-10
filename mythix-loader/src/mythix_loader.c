@@ -38,6 +38,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <versionhelpers.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -150,8 +151,17 @@ static void strip_quotes(wchar_t *s) {
     }
 }
 
-static int parse_bool(const wchar_t *v) {
-    return v[0] == L'1' || _wcsicmp(v, L"true") == 0;
+/* 1/true/yes/on or 0/false/no/off; anything else keeps the default (with a
+ * warning), so a typo can't silently flip a default-on key off. */
+static int parse_bool(const wchar_t *key, const wchar_t *v, int dflt) {
+    static const wchar_t *const on[] = { L"1", L"true", L"yes", L"on" };
+    static const wchar_t *const off[] = { L"0", L"false", L"no", L"off" };
+    for (size_t i = 0; i < ARRAYSIZE(on); i++) {
+        if (_wcsicmp(v, on[i]) == 0) return 1;
+        if (_wcsicmp(v, off[i]) == 0) return 0;
+    }
+    if (v[0]) mlog(L"Warning: %ls=%ls isn't 1/0 (true/false, yes/no, on/off); using %d", key, v, dflt);
+    return dflt;
 }
 
 /* Copy a value into a fixed buffer, warning instead of silently cutting it. */
@@ -262,9 +272,9 @@ static int read_ini(const wchar_t *path, Config *cfg) {
         else if (_wcsicmp(key, L"AppId") == 0)          SET(app_id);
         else if (_wcsicmp(key, L"ExtraDlls") == 0)      SET(extra_dlls);
         else if (_wcsicmp(key, L"EnvVars") == 0)        SET(env_vars);
-        else if (_wcsicmp(key, L"Persist") == 0)        cfg->persist = parse_bool(val);
-        else if (_wcsicmp(key, L"WaitForChildren") == 0) cfg->wait_children = parse_bool(val);
-        else if (_wcsicmp(key, L"Debug") == 0)          cfg->debug = parse_bool(val);
+        else if (_wcsicmp(key, L"Persist") == 0)        cfg->persist = parse_bool(key, val, 0);
+        else if (_wcsicmp(key, L"WaitForChildren") == 0) cfg->wait_children = parse_bool(key, val, 1);
+        else if (_wcsicmp(key, L"Debug") == 0)          cfg->debug = parse_bool(key, val, 0);
         /* SteamClientDll/SteamClient64Dll/SteamClientSo/SteamClient64So, ForceArch
          * and NoInject (written by older profiles) are ignored. */
 #undef SET
@@ -400,18 +410,26 @@ typedef struct {
     DWORD  pids[256];               /* live processes, from the job's messages */
     int    n_pids;
     int    pids_overflowed;         /* more than fit: the list is incomplete */
+    DWORD  shown[256];              /* what the last "still waiting" list named */
+    DWORD  blocking[256];           /* scratch for the current blocking set */
 } ProcessTree;
 
-/* Wine before 6.9 has no nested jobs: a game that puts its own children in a
- * job (Chromium/CEF do, and kill the child if that fails) would break inside
- * ours. Always true on Windows. */
+/* Jobs only nest on Windows 8+ and Wine 6.9+. Without that, a game that puts
+ * its own children in a job (Chromium/CEF do, and kill the child if that
+ * fails) would break inside ours. */
 static int jobs_can_nest(void) {
     typedef const char *(CDECL *wine_get_version_fn)(void);
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     wine_get_version_fn get_version = ntdll
         ? (wine_get_version_fn)(void (*)(void))GetProcAddress(ntdll, "wine_get_version")
         : NULL;
-    const char *v = get_version ? get_version() : NULL;
+    if (!get_version) {
+        if (IsWindows8OrGreater()) return 1;
+        mlog(L"Windows 7 can't nest job objects, so the loader can't follow the processes "
+             L"a game starts; waiting for the exe only");
+        return 0;
+    }
+    const char *v = get_version();
     int major = 0, minor = 0;
     if (!v || sscanf(v, "%d.%d", &major, &minor) < 1) return 1;
     dbg(L"Running on Wine %hs", v);
@@ -516,12 +534,36 @@ static int only_helpers_left(const ProcessTree *t) {
     return 1;
 }
 
+/* The job's processes that aren't Wine helpers, into out[] (sorted). */
+static int blocking_pids(const ProcessTree *t, DWORD *out) {
+    int n = 0;
+    for (int i = 0; i < t->n_pids; i++) {
+        if (is_wine_helper(process_image(t->pids[i]))) continue;
+        int j = n++;
+        while (j > 0 && out[j - 1] > t->pids[i]) { out[j] = out[j - 1]; j--; }
+        out[j] = t->pids[i];
+    }
+    return n;
+}
+
+static void log_blocking(const DWORD *pids, int n, int incomplete) {
+    for (int i = 0; i < n; i++) mlog(L"  PID %lu: %ls", pids[i], process_image(pids[i]));
+    if (incomplete) mlog(L"  (and more; the list is incomplete)");
+    mlog(L"(if one of these never exits, close it: the loader waits until it does)");
+}
+
 /* Returns once every process in the job has exited, or only Wine helpers
- * are left (for two seconds) after the game exe has gone. */
-static void tree_wait(ProcessTree *t, const PROCESS_INFORMATION *pi) {
+ * are left (for two seconds) after the game exe has gone. Returns 1 when
+ * the game's processes outlived its exe. */
+static int tree_wait(ProcessTree *t, const PROCESS_INFORMATION *pi) {
     long live = 0;                  /* processes in the job, from its messages */
-    int exe_gone = 0;
+    int exe_gone = 0, outlived = 0;
     DWORD helpers_since = 0;        /* tick count when only helpers were left */
+    /* The last list printed, and when it went stale, so it can be printed
+     * again once things settle. */
+    DWORD *shown = t->shown, *now_pids = t->blocking;
+    int n_shown = 0;
+    DWORD stale_since = 0, last_relist = 0;
     for (;;) {
         DWORD msg = 0;
         ULONG_PTR key = 0;
@@ -531,10 +573,10 @@ static void tree_wait(ProcessTree *t, const PROCESS_INFORMATION *pi) {
              * also check the count directly. If the job can't tell us, fall
              * back to waiting for the exe. */
             long n = (GetLastError() == WAIT_TIMEOUT) ? tree_active(t) : -1;
-            if (n == 0) return;
+            if (n == 0) return outlived;
             if (n < 0) {
                 WaitForSingleObject(pi->hProcess, INFINITE);
-                return;
+                return outlived;
             }
             msg = 0;                    /* fall through to the helper check */
         } else if (key != (ULONG_PTR)t->job) {
@@ -557,32 +599,63 @@ static void tree_wait(ProcessTree *t, const PROCESS_INFORMATION *pi) {
                 break;
             }
             exe_gone = 1;
-            if (live > 0 && !only_helpers_left(t)) {
-                /* Say what is keeping the loader around, in case it never ends. */
-                mlog(L"Game exe exited; still waiting for %ld process(es) it started:", live);
-                for (int i = 0; i < t->n_pids; i++) {
-                    const wchar_t *img = process_image(t->pids[i]);
-                    mlog(L"  PID %lu: %ls%ls", t->pids[i], img,
-                         is_wine_helper(img) ? L" (Wine helper, not waited for)" : L"");
+            if (live > 0) {
+                DWORD code = 0;
+                WaitForSingleObject(pi->hProcess, 5000);
+                GetExitCodeProcess(pi->hProcess, &code);
+                n_shown = blocking_pids(t, shown);
+                if (n_shown > 0) {
+                    /* Say what is keeping the loader around, in case it never ends. */
+                    outlived = 1;
+                    mlog(L"Game exe exited (code %lu); still waiting for %d process(es) it started:",
+                         code, n_shown);
+                    log_blocking(shown, n_shown, t->pids_overflowed);
                 }
-                mlog(L"(WaitForChildren=0 in the ini makes Persist wait for the exe only)");
             }
             break;
         case JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO:
-            return;
+            return outlived;
         }
 
         if (!exe_gone) continue;
+        DWORD now = GetTickCount();
         if (!only_helpers_left(t)) {
             helpers_since = 0;
         } else if (!helpers_since) {
-            helpers_since = GetTickCount() | 1;
-        } else if (GetTickCount() - helpers_since >= 2000) {
+            helpers_since = now | 1;
+        } else if (now - helpers_since >= 2000) {
             for (int i = 0; i < t->n_pids; i++)
                 dbg(L"Not waiting for Wine helper PID %lu: %ls",
                     t->pids[i], process_image(t->pids[i]));
             mlog(L"Only Wine helper processes are left; done waiting");
-            return;
+            return outlived;
+        }
+
+        /* Once a process the last list named has exited but the wait goes on,
+         * that list is stale: print the current one after two quiet seconds
+         * (and then not more than every 30 s), so the log names what the
+         * loader is really waiting for, e.g. a helper the real game left
+         * behind after a launcher exe handed over to it. */
+        int n_now = blocking_pids(t, now_pids);
+        if (n_now == 0) continue;
+        outlived = 1;
+        int stale = n_shown == 0;
+        for (int i = 0; i < n_shown && !stale; i++) {
+            int alive = 0;
+            for (int j = 0; j < n_now && !alive; j++) alive = now_pids[j] == shown[i];
+            stale = !alive;
+        }
+        if (!stale) {
+            stale_since = 0;
+        } else if (!stale_since) {
+            stale_since = now | 1;
+        } else if (now - stale_since >= 2000 && (!last_relist || now - last_relist >= 30000)) {
+            memcpy(shown, now_pids, n_now * sizeof(DWORD));
+            n_shown = n_now;
+            stale_since = 0;
+            last_relist = now;
+            mlog(L"Still waiting for %d process(es) the game started:", n_shown);
+            log_blocking(shown, n_shown, t->pids_overflowed);
         }
     }
 }
@@ -668,11 +741,14 @@ static DWORD launch_game(Config *cfg, int extra_argc, wchar_t **extra_argv) {
 
     DWORD exit_code = 0;
     if (cfg->persist) {
-        dbg(L"Waiting for the game%ls to exit...", track ? L" and everything it starts" : L"");
-        if (track) tree_wait(&tree, &pi);
+        dbg(L"Waiting for the game%ls to exit...", track ? L" and the processes it starts" : L"");
+        int outlived = track ? tree_wait(&tree, &pi) : 0;
         WaitForSingleObject(pi.hProcess, INFINITE);     /* already done when tracking */
         GetExitCodeProcess(pi.hProcess, &exit_code);
-        mlog(L"Game exited (code %lu)", exit_code);
+        if (outlived)
+            mlog(L"All game processes have exited; returning the exe's exit code %lu", exit_code);
+        else
+            mlog(L"Game exited (code %lu)", exit_code);
     }
     tree_close(&tree);
     CloseHandle(pi.hProcess);
