@@ -9,9 +9,16 @@
  *
  * Arguments given to the loader itself (other than --ini <path> and --debug) are
  * passed on to the game after ExeCommandLine, so per-game launch args set in the
- * Mythix launcher (e.g. -dx11) reach it.
+ * Mythix launcher (e.g. -dx11) reach it. Everything after "--" goes to the game
+ * as-is, so a game can still be handed its own --debug.
  *
- * v1.3: no longer points its DLL search at a copied steamclient folder. The
+ * v1.3: Unicode throughout. The ini is read as UTF-8 (what mythix-loader writes;
+ *       a BOM, a UTF-16 ini saved by Notepad or a legacy ANSI ini work too) and
+ *       the game is started with the wide Windows APIs, so paths with non-ASCII
+ *       characters launch. Without ExeRunDir the game now starts in its own
+ *       folder ("/"-style paths included) instead of wherever the loader was
+ *       started. AppId=0 is no longer exported as SteamAppId.
+ *       No longer points its DLL search at a copied steamclient folder. The
  *       loader never loads steamclient itself, and the game's steam_api finds
  *       the running Steam's own steamclient; with the "/home/..." paths profiles
  *       use under Wine the SetDllDirectory call never even ran. The
@@ -19,168 +26,319 @@
  * v1.2: no longer copies steamclient dll/so files into the run directory at
  *       launch (nothing used those copies); forwards extra arguments to the game.
  *
- * Cross-compile on Linux:
- *   x86_64-w64-mingw32-gcc -O2 -o mythix_loader.exe mythix_loader.c -lshlwapi
- *   i686-w64-mingw32-gcc -O2 -o mythix_loader_32.exe mythix_loader.c -lshlwapi
+ * Cross-compile on Linux (or just run make):
+ *   x86_64-w64-mingw32-gcc -O2 -municode -s -o mythix_loader.exe mythix_loader.c
+ *   i686-w64-mingw32-gcc -O2 -municode -s -o mythix_loader_32.exe mythix_loader.c
  *
  * Part of the Mythix toolkit.
  */
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <shlwapi.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
-#define MAX_LINE   4096
-#define MAX_PATH_W 4096
-#define INI_NAME   "mythix_loader.ini"
-
-/* ── Config ────────────────────────────────────────────────────────────── */
-
-typedef struct {
-    char exe[MAX_PATH_W];
-    char exe_run_dir[MAX_PATH_W];
-    char exe_cmd_line[MAX_PATH_W];
-    char app_id[64];
-    char extra_dlls[MAX_PATH_W];
-    char env_vars[MAX_PATH_W * 4];
-    int  persist;
-    int  debug;
-} Config;
-
-static void trim(char *s) {
-    char *end;
-    while (*s == ' ' || *s == '\t') memmove(s, s + 1, strlen(s));
-    end = s + strlen(s) - 1;
-    while (end > s && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n'))
-        *end-- = '\0';
-}
-
-static void strip_quotes(char *s) {
-    size_t len = strlen(s);
-    if (len >= 2 && s[0] == '"' && s[len - 1] == '"') {
-        memmove(s, s + 1, len - 2);
-        s[len - 2] = '\0';
-    }
-}
-
-static int read_ini(const char *path, Config *cfg) {
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-
-    char line[MAX_LINE];
-    int in_section = 0;
-
-    memset(cfg, 0, sizeof(*cfg));
-
-    while (fgets(line, sizeof(line), f)) {
-        trim(line);
-        if (!line[0] || line[0] == '#' || line[0] == ';') continue;
-
-        if (line[0] == '[') {
-            in_section = (_stricmp(line, "[MythixLoader]") == 0);
-            continue;
-        }
-        if (!in_section) continue;
-
-        char *eq = strchr(line, '=');
-        if (!eq) continue;
-        *eq = '\0';
-        char *key = line;
-        char *val = eq + 1;
-        trim(key);
-        trim(val);
-        strip_quotes(val);
-
-        if      (_stricmp(key, "Exe") == 0)              strncpy(cfg->exe, val, sizeof(cfg->exe) - 1);
-        else if (_stricmp(key, "ExeRunDir") == 0)        strncpy(cfg->exe_run_dir, val, sizeof(cfg->exe_run_dir) - 1);
-        else if (_stricmp(key, "ExeCommandLine") == 0)   strncpy(cfg->exe_cmd_line, val, sizeof(cfg->exe_cmd_line) - 1);
-        else if (_stricmp(key, "AppId") == 0)            strncpy(cfg->app_id, val, sizeof(cfg->app_id) - 1);
-        else if (_stricmp(key, "ExtraDlls") == 0)        strncpy(cfg->extra_dlls, val, sizeof(cfg->extra_dlls) - 1);
-        else if (_stricmp(key, "EnvVars") == 0)          strncpy(cfg->env_vars, val, sizeof(cfg->env_vars) - 1);
-        else if (_stricmp(key, "Persist") == 0)          cfg->persist = (val[0] == '1' || _stricmp(val, "true") == 0);
-        else if (_stricmp(key, "Debug") == 0)            cfg->debug = (val[0] == '1' || _stricmp(val, "true") == 0);
-        /* SteamClientDll/SteamClient64Dll/SteamClientSo/SteamClient64So, ForceArch
-         * and NoInject (written by older profiles) are ignored. */
-    }
-    fclose(f);
-    return cfg->exe[0] != '\0';
-}
+#define MAX_PATH_W   4096
+#define MAX_CMD_LINE 32768          /* CreateProcessW's limit, terminator included */
+#define MAX_INI_SIZE (1 << 20)
+#define INI_NAME     L"mythix_loader.ini"
 
 /* ── Logging ───────────────────────────────────────────────────────────── */
 
 static int g_debug = 0;
 
-static void mlog(const char *fmt, ...) {
+/* Write to stderr: WriteConsoleW on a real console, UTF-8 bytes otherwise
+ * (pipes, and the unix stderr Wine hands through). */
+static void put_err(const wchar_t *s) {
+    HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    DWORD mode, n;
+    if (h == NULL || h == INVALID_HANDLE_VALUE) return;
+    if (GetConsoleMode(h, &mode)) {
+        WriteConsoleW(h, s, (DWORD)wcslen(s), &n, NULL);
+        return;
+    }
+    int len = WideCharToMultiByte(CP_UTF8, 0, s, -1, NULL, 0, NULL, NULL);
+    if (len <= 1) return;
+    char *buf = malloc((size_t)len);
+    if (!buf) return;
+    WideCharToMultiByte(CP_UTF8, 0, s, -1, buf, len, NULL, NULL);
+    WriteFile(h, buf, (DWORD)(len - 1), &n, NULL);
+    free(buf);
+}
+
+/* Formats use the wide printf rules: %ls for wide strings. */
+static void vlog(const wchar_t *tag, const wchar_t *fmt, va_list ap) {
+    static wchar_t msg[MAX_CMD_LINE + 512];     /* fits a full command line */
+    const size_t cap = ARRAYSIZE(msg);
+    size_t len = (size_t)_snwprintf(msg, cap, L"[%ls] ", tag);
+    size_t room = cap - len - 2;                /* keep space for "\n" + NUL */
+    _vsnwprintf(msg + len, room, fmt, ap);
+    msg[len + room] = L'\0';                    /* terminate even if truncated */
+    len = wcslen(msg);
+    msg[len++] = L'\n';
+    msg[len] = L'\0';
+    put_err(msg);
+}
+
+static void mlog(const wchar_t *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "[mythix-loader] ");
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
+    vlog(L"mythix-loader", fmt, ap);
     va_end(ap);
 }
 
-static void dbg(const char *fmt, ...) {
+static void dbg(const wchar_t *fmt, ...) {
     if (!g_debug) return;
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "[mythix-loader:dbg] ");
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
+    vlog(L"mythix-loader:dbg", fmt, ap);
     va_end(ap);
+}
+
+/* "error 2: The system cannot find the file specified" */
+static const wchar_t *err_text(DWORD code) {
+    static wchar_t buf[600];
+    wchar_t sys[512];
+    DWORD n = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                             NULL, code, 0, sys, ARRAYSIZE(sys), NULL);
+    while (n > 0 && (sys[n - 1] == L'\r' || sys[n - 1] == L'\n' ||
+                     sys[n - 1] == L' ' || sys[n - 1] == L'.'))
+        sys[--n] = L'\0';
+    if (n > 0) _snwprintf(buf, ARRAYSIZE(buf), L"error %lu: %ls", code, sys);
+    else       _snwprintf(buf, ARRAYSIZE(buf), L"error %lu", code);
+    buf[ARRAYSIZE(buf) - 1] = L'\0';
+    return buf;
+}
+
+/* ── Config ────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    wchar_t exe[MAX_PATH_W];
+    wchar_t exe_run_dir[MAX_PATH_W];
+    wchar_t exe_cmd_line[MAX_PATH_W];
+    wchar_t app_id[64];
+    wchar_t extra_dlls[MAX_PATH_W];
+    wchar_t env_vars[MAX_PATH_W * 4];
+    int     persist;
+    int     debug;
+} Config;
+
+static int is_space(wchar_t c) {
+    return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n';
+}
+
+/* Trims trailing whitespace in place; returns the first non-space character. */
+static wchar_t *trim(wchar_t *s) {
+    while (is_space(*s)) s++;
+    size_t n = wcslen(s);
+    while (n > 0 && is_space(s[n - 1])) s[--n] = L'\0';
+    return s;
+}
+
+static void strip_quotes(wchar_t *s) {
+    size_t len = wcslen(s);
+    if (len >= 2 && s[0] == L'"' && s[len - 1] == L'"') {
+        memmove(s, s + 1, (len - 2) * sizeof(wchar_t));
+        s[len - 2] = L'\0';
+    }
+}
+
+static int parse_bool(const wchar_t *v) {
+    return v[0] == L'1' || _wcsicmp(v, L"true") == 0;
+}
+
+/* Copy a value into a fixed buffer, warning instead of silently cutting it. */
+static void set_value(wchar_t *dst, size_t cap, const wchar_t *key, const wchar_t *val) {
+    size_t len = wcslen(val);
+    if (len >= cap) {
+        mlog(L"Warning: %ls is too long (%u characters, max %u), truncated",
+             key, (unsigned)len, (unsigned)(cap - 1));
+        len = cap - 1;
+    }
+    memcpy(dst, val, len * sizeof(wchar_t));
+    dst[len] = L'\0';
+}
+
+/* Read a whole text file as a NUL-terminated wide string (caller frees).
+ * mythix-loader writes UTF-8; a UTF-8 BOM, UTF-16LE (Notepad's "Unicode") and
+ * a legacy ANSI file from a Windows editor are read correctly too. */
+static wchar_t *read_text_file(const wchar_t *path) {
+    HANDLE h = CreateFileW(path, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+
+    LARGE_INTEGER size;
+    char *raw = NULL;
+    DWORD got = 0;
+    if (GetFileSizeEx(h, &size) && size.QuadPart <= MAX_INI_SIZE)
+        raw = malloc((size_t)size.QuadPart + 1);
+    if (raw && !ReadFile(h, raw, (DWORD)size.QuadPart, &got, NULL)) {
+        free(raw);
+        raw = NULL;
+    }
+    CloseHandle(h);
+    if (!raw) return NULL;
+
+    const char *p = raw;
+    int len = (int)got;
+    wchar_t *text;
+    if (len >= 2 && (unsigned char)p[0] == 0xFF && (unsigned char)p[1] == 0xFE) {
+        int wlen = (len - 2) / 2;
+        text = malloc(((size_t)wlen + 1) * sizeof(wchar_t));
+        if (text) {
+            memcpy(text, p + 2, (size_t)wlen * sizeof(wchar_t));
+            text[wlen] = L'\0';
+        }
+    } else {
+        if (len >= 3 && memcmp(p, "\xEF\xBB\xBF", 3) == 0) {
+            p += 3;
+            len -= 3;
+        }
+        UINT cp = CP_UTF8;
+        DWORD flags = MB_ERR_INVALID_CHARS;
+        int wlen = len ? MultiByteToWideChar(cp, flags, p, len, NULL, 0) : 0;
+        if (len && !wlen) {                     /* not UTF-8: ANSI code page */
+            cp = CP_ACP;
+            flags = 0;
+            wlen = MultiByteToWideChar(cp, flags, p, len, NULL, 0);
+        }
+        text = malloc(((size_t)wlen + 1) * sizeof(wchar_t));
+        if (text) {
+            if (wlen) MultiByteToWideChar(cp, flags, p, len, text, wlen);
+            text[wlen] = L'\0';
+        }
+    }
+    free(raw);
+    return text;
+}
+
+/* Returns -1 if the file can't be read, 0 if it has no Exe=, 1 if usable. */
+static int read_ini(const wchar_t *path, Config *cfg) {
+    wchar_t *text = read_text_file(path);
+    if (!text) return -1;
+
+    memset(cfg, 0, sizeof(*cfg));
+    int in_section = 0;
+    wchar_t *next = text;
+    while (next) {
+        wchar_t *line = next;
+        wchar_t *nl = wcschr(line, L'\n');
+        if (nl) {
+            *nl = L'\0';
+            next = nl + 1;
+        } else {
+            next = NULL;
+        }
+
+        line = trim(line);
+        if (!line[0] || line[0] == L'#' || line[0] == L';') continue;
+
+        if (line[0] == L'[') {
+            in_section = (_wcsicmp(line, L"[MythixLoader]") == 0);
+            continue;
+        }
+        if (!in_section) continue;
+
+        wchar_t *eq = wcschr(line, L'=');
+        if (!eq) continue;
+        *eq = L'\0';
+        wchar_t *key = trim(line);
+        wchar_t *val = trim(eq + 1);
+        strip_quotes(val);
+
+#define SET(field) set_value(cfg->field, ARRAYSIZE(cfg->field), key, val)
+        if      (_wcsicmp(key, L"Exe") == 0)            SET(exe);
+        else if (_wcsicmp(key, L"ExeRunDir") == 0)      SET(exe_run_dir);
+        else if (_wcsicmp(key, L"ExeCommandLine") == 0) SET(exe_cmd_line);
+        else if (_wcsicmp(key, L"AppId") == 0)          SET(app_id);
+        else if (_wcsicmp(key, L"ExtraDlls") == 0)      SET(extra_dlls);
+        else if (_wcsicmp(key, L"EnvVars") == 0)        SET(env_vars);
+        else if (_wcsicmp(key, L"Persist") == 0)        cfg->persist = parse_bool(val);
+        else if (_wcsicmp(key, L"Debug") == 0)          cfg->debug = parse_bool(val);
+        /* SteamClientDll/SteamClient64Dll/SteamClientSo/SteamClient64So, ForceArch
+         * and NoInject (written by older profiles) are ignored. */
+#undef SET
+    }
+    free(text);
+    return cfg->exe[0] != L'\0';
+}
+
+/* Cut a path down to its folder. Accepts "\" and "/" separators: profiles
+ * written on Linux use "/home/..." paths, which Wine maps through Z:. */
+static void parent_dir(wchar_t *path) {
+    wchar_t *sep = NULL;
+    for (wchar_t *p = path; *p; p++)
+        if (*p == L'\\' || *p == L'/') sep = p;
+    if (!sep)
+        path[0] = L'\0';
+    else if (sep == path || (sep == path + 2 && path[1] == L':'))
+        sep[1] = L'\0';                         /* keep the root: "/" or "C:\" */
+    else
+        *sep = L'\0';
 }
 
 /* ── Environment setup ─────────────────────────────────────────────────── */
 
+static int all_digits(const wchar_t *s) {
+    if (!*s) return 0;
+    for (; *s; s++)
+        if (*s < L'0' || *s > L'9') return 0;
+    return 1;
+}
+
 static void set_env_vars(Config *cfg) {
-    if (cfg->app_id[0]) {
-        SetEnvironmentVariableA("SteamAppId", cfg->app_id);
-        SetEnvironmentVariableA("SteamGameId", cfg->app_id);
-        SetEnvironmentVariableA("SteamOverlayGameId", cfg->app_id);
-        dbg("Set SteamAppId=%s", cfg->app_id);
+    if (all_digits(cfg->app_id) && wcscmp(cfg->app_id, L"0") != 0) {
+        SetEnvironmentVariableW(L"SteamAppId", cfg->app_id);
+        SetEnvironmentVariableW(L"SteamGameId", cfg->app_id);
+        SetEnvironmentVariableW(L"SteamOverlayGameId", cfg->app_id);
+        dbg(L"Set SteamAppId=%ls", cfg->app_id);
+    } else if (cfg->app_id[0]) {
+        /* mythix-loader writes AppId=0 for games it couldn't find in the library. */
+        mlog(L"Warning: AppId=%ls is not a Steam app id; SteamAppId not set", cfg->app_id);
+    } else {
+        dbg(L"No AppId in the ini; SteamAppId not set");
     }
 
-    if (cfg->env_vars[0]) {
-        char vars[MAX_PATH_W * 4];
-        strncpy(vars, cfg->env_vars, sizeof(vars) - 1);
-        char *tok = strtok(vars, ";");
-        while (tok) {
-            trim(tok);
-            char *eq = strchr(tok, '=');
-            if (eq) {
-                *eq = '\0';
-                char *k = tok, *v = eq + 1;
-                trim(k); trim(v);
-                SetEnvironmentVariableA(k, v);
-                dbg("Set env: %s=%s", k, v);
-            }
-            tok = strtok(NULL, ";");
-        }
+    if (!cfg->env_vars[0]) return;
+    wchar_t *vars = _wcsdup(cfg->env_vars);
+    if (!vars) return;
+    for (wchar_t *tok = vars, *end; tok; tok = end) {
+        end = wcschr(tok, L';');
+        if (end) *end++ = L'\0';
+        wchar_t *eq = wcschr(tok, L'=');
+        if (!eq) continue;
+        *eq = L'\0';
+        wchar_t *k = trim(tok), *v = trim(eq + 1);
+        if (!k[0]) continue;
+        SetEnvironmentVariableW(k, v);
+        dbg(L"Set env: %ls=%ls", k, v);
     }
+    free(vars);
 }
 
 /* ── Extra DLL loading ─────────────────────────────────────────────────── */
 
+/* These load into the loader process, not the game. */
 static void load_extra_dlls(Config *cfg) {
     if (!cfg->extra_dlls[0]) return;
-
-    char dlls[MAX_PATH_W];
-    strncpy(dlls, cfg->extra_dlls, sizeof(dlls) - 1);
-    char *tok = strtok(dlls, ";");
-    while (tok) {
-        trim(tok);
-        if (tok[0]) {
-            HMODULE h = LoadLibraryA(tok);
-            if (h) {
-                dbg("Loaded extra DLL: %s", tok);
-            } else {
-                mlog("Warning: failed to load extra DLL: %s (error %lu)", tok, GetLastError());
-            }
+    wchar_t *dlls = _wcsdup(cfg->extra_dlls);
+    if (!dlls) return;
+    for (wchar_t *tok = dlls, *end; tok; tok = end) {
+        end = wcschr(tok, L';');
+        if (end) *end++ = L'\0';
+        wchar_t *path = trim(tok);
+        if (!path[0]) continue;
+        if (LoadLibraryW(path)) {
+            dbg(L"Loaded extra DLL: %ls", path);
+        } else {
+            mlog(L"Warning: failed to load extra DLL: %ls (%ls)", path, err_text(GetLastError()));
         }
-        tok = strtok(NULL, ";");
     }
+    free(dlls);
 }
 
 /* ── Process launch ────────────────────────────────────────────────────── */
@@ -188,74 +346,72 @@ static void load_extra_dlls(Config *cfg) {
 /* Append one argument to a Windows command line, quoted so the game's runtime
  * (CommandLineToArgvW / the MSVC CRT rules) reads it back unchanged. Returns 0
  * and leaves the line untouched if it would not fit. */
-static int append_arg(char *buf, size_t cap, const char *arg) {
-    size_t len = strlen(buf);
+static int append_arg(wchar_t *buf, size_t cap, const wchar_t *arg) {
+    size_t len = wcslen(buf);
     const size_t start = len;
-    int quote = (arg[0] == '\0') || strpbrk(arg, " \t\n\v\"") != NULL;
+    int quote = (arg[0] == L'\0') || wcspbrk(arg, L" \t\n\v\"") != NULL;
 
-#define PUT(c) do { if (len + 1 >= cap) { buf[start] = '\0'; return 0; } buf[len++] = (c); } while (0)
-    if (len > 0) PUT(' ');
+#define PUT(c) do { if (len + 1 >= cap) { buf[start] = L'\0'; return 0; } buf[len++] = (c); } while (0)
+    if (len > 0) PUT(L' ');
     if (!quote) {
-        for (const char *p = arg; *p; p++) PUT(*p);
+        for (const wchar_t *p = arg; *p; p++) PUT(*p);
     } else {
-        PUT('"');
-        for (const char *p = arg; ; p++) {
+        PUT(L'"');
+        for (const wchar_t *p = arg; ; p++) {
             size_t slashes = 0;
-            while (*p == '\\') { slashes++; p++; }
-            if (*p == '\0') {
+            while (*p == L'\\') { slashes++; p++; }
+            if (*p == L'\0') {
                 /* Double trailing backslashes so they don't escape the closing quote. */
-                for (size_t i = 0; i < slashes * 2; i++) PUT('\\');
+                for (size_t i = 0; i < slashes * 2; i++) PUT(L'\\');
                 break;
             }
-            if (*p == '"') {
-                for (size_t i = 0; i < slashes * 2 + 1; i++) PUT('\\');
+            if (*p == L'"') {
+                for (size_t i = 0; i < slashes * 2 + 1; i++) PUT(L'\\');
             } else {
-                for (size_t i = 0; i < slashes; i++) PUT('\\');
+                for (size_t i = 0; i < slashes; i++) PUT(L'\\');
             }
             PUT(*p);
         }
-        PUT('"');
+        PUT(L'"');
     }
 #undef PUT
-    buf[len] = '\0';
+    buf[len] = L'\0';
     return 1;
 }
 
-static DWORD launch_game(Config *cfg, int extra_argc, char **extra_argv) {
-    char cmd_line[MAX_PATH_W * 4];
+static DWORD launch_game(Config *cfg, int extra_argc, wchar_t **extra_argv) {
+    /* Exe and ExeCommandLine are each capped at MAX_PATH_W, so this always fits. */
+    static wchar_t cmd_line[MAX_CMD_LINE];
     if (cfg->exe_cmd_line[0]) {
-        snprintf(cmd_line, sizeof(cmd_line), "\"%s\" %s", cfg->exe, cfg->exe_cmd_line);
+        _snwprintf(cmd_line, MAX_CMD_LINE, L"\"%ls\" %ls", cfg->exe, cfg->exe_cmd_line);
     } else {
-        snprintf(cmd_line, sizeof(cmd_line), "\"%s\"", cfg->exe);
+        _snwprintf(cmd_line, MAX_CMD_LINE, L"\"%ls\"", cfg->exe);
     }
+    cmd_line[MAX_CMD_LINE - 1] = L'\0';
 
     /* The loader's own extra arguments go to the game, after ExeCommandLine. */
     for (int i = 0; i < extra_argc; i++) {
-        if (!append_arg(cmd_line, sizeof(cmd_line), extra_argv[i])) {
-            mlog("Warning: command line too long, dropped argument: %s", extra_argv[i]);
+        if (!append_arg(cmd_line, MAX_CMD_LINE, extra_argv[i])) {
+            mlog(L"Warning: command line too long, dropped argument: %ls", extra_argv[i]);
         }
     }
-    if (extra_argc > 0) dbg("Forwarded %d extra argument(s) to the game", extra_argc);
+    if (extra_argc > 0) dbg(L"Forwarded %d extra argument(s) to the game", extra_argc);
 
-    char run_dir[MAX_PATH_W];
-    if (cfg->exe_run_dir[0]) {
-        strncpy(run_dir, cfg->exe_run_dir, sizeof(run_dir) - 1);
-    } else {
-        strncpy(run_dir, cfg->exe, sizeof(run_dir) - 1);
-        PathRemoveFileSpecA(run_dir);
-    }
-    run_dir[sizeof(run_dir) - 1] = '\0';
+    /* Default to the exe's own folder, like starting it from Explorer. */
+    wchar_t run_dir[MAX_PATH_W];
+    wcscpy(run_dir, cfg->exe_run_dir[0] ? cfg->exe_run_dir : cfg->exe);
+    if (!cfg->exe_run_dir[0]) parent_dir(run_dir);
 
-    STARTUPINFOA si;
+    STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
 
-    mlog("Launching: %s", cmd_line);
-    mlog("Working dir: %s", run_dir);
+    mlog(L"Launching: %ls", cmd_line);
+    mlog(L"Working dir: %ls", run_dir[0] ? run_dir : L"(inherited)");
 
-    BOOL ok = CreateProcessA(
+    BOOL ok = CreateProcessW(
         NULL,
         cmd_line,
         NULL, NULL,
@@ -268,68 +424,83 @@ static DWORD launch_game(Config *cfg, int extra_argc, char **extra_argv) {
     );
 
     if (!ok) {
-        mlog("Error: CreateProcess failed (error %lu)", GetLastError());
+        DWORD e = GetLastError();
+        mlog(L"Error: could not start the game (%ls)", err_text(e));
+        if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND)
+            mlog(L"Check Exe= in the ini: is the game still installed there?");
+        else if (e == ERROR_DIRECTORY)
+            mlog(L"Check ExeRunDir= in the ini: it must be an existing folder");
         return 1;
     }
 
-    mlog("Game launched (PID %lu)", pi.dwProcessId);
+    mlog(L"Game launched (PID %lu)", pi.dwProcessId);
 
+    DWORD exit_code = 0;
     if (cfg->persist) {
-        dbg("Waiting for game to exit...");
+        dbg(L"Waiting for game to exit...");
         WaitForSingleObject(pi.hProcess, INFINITE);
-        DWORD exit_code = 0;
         GetExitCodeProcess(pi.hProcess, &exit_code);
-        mlog("Game exited (code %lu)", exit_code);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        return exit_code;
+        mlog(L"Game exited (code %lu)", exit_code);
     }
-
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return 0;
+    return exit_code;
 }
 
 /* ── Main ──────────────────────────────────────────────────────────────── */
 
-int main(int argc, char *argv[]) {
-    mlog("Mythix Loader v1.3");
+int wmain(int argc, wchar_t *argv[]) {
+    mlog(L"Mythix Loader v1.3");
 
     /* Find our own directory for the ini */
-    char self_dir[MAX_PATH_W];
-    GetModuleFileNameA(NULL, self_dir, sizeof(self_dir));
-    PathRemoveFileSpecA(self_dir);
-
-    char ini_path[MAX_PATH_W];
+    wchar_t self_dir[MAX_PATH_W];
+    DWORD n = GetModuleFileNameW(NULL, self_dir, MAX_PATH_W);
+    if (n == 0 || n >= MAX_PATH_W) wcscpy(self_dir, L".");
+    else parent_dir(self_dir);
 
     /* Our own flags are --ini <path> and --debug; everything else is collected
-     * and passed through to the game. */
-    const char *ini_override = NULL;
-    char **extra = (char **)calloc((size_t)argc, sizeof(char *));
+     * and passed through to the game. Everything after "--" is the game's. */
+    const wchar_t *ini_override = NULL;
+    wchar_t **extra = calloc((size_t)argc, sizeof(wchar_t *));
     int n_extra = 0;
+    if (!extra) {
+        mlog(L"Error: out of memory");
+        return 1;
+    }
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--ini") == 0 && i + 1 < argc) {
+        if (wcscmp(argv[i], L"--") == 0) {
+            while (++i < argc) extra[n_extra++] = argv[i];
+        } else if (wcscmp(argv[i], L"--ini") == 0 && i + 1 < argc) {
             ini_override = argv[++i];
-        } else if (strcmp(argv[i], "--debug") == 0) {
+        } else if (wcscmp(argv[i], L"--debug") == 0) {
             g_debug = 1;
-        } else if (extra) {
+        } else {
             extra[n_extra++] = argv[i];
         }
     }
 
+    wchar_t ini_path[MAX_PATH_W];
     if (ini_override) {
-        strncpy(ini_path, ini_override, sizeof(ini_path) - 1);
+        set_value(ini_path, MAX_PATH_W, L"--ini", ini_override);
     } else {
-        snprintf(ini_path, sizeof(ini_path), "%s\\" INI_NAME, self_dir);
+        _snwprintf(ini_path, MAX_PATH_W, L"%ls\\" INI_NAME, self_dir);
+        ini_path[MAX_PATH_W - 1] = L'\0';
     }
 
-    Config cfg;
-    if (!read_ini(ini_path, &cfg)) {
-        mlog("Error: could not read config from %s", ini_path);
-        mlog("Create %s\\" INI_NAME " with at least [MythixLoader] Exe=path", self_dir);
+    static Config cfg;
+    int r = read_ini(ini_path, &cfg);
+    if (r < 0) {
+        mlog(L"Error: could not read config from %ls", ini_path);
+        mlog(L"Create %ls\\" INI_NAME L" with at least [MythixLoader] Exe=path", self_dir);
+        free(extra);
         return 1;
     }
-    mlog("Config: %s", ini_path);
+    if (r == 0) {
+        mlog(L"Error: %ls has no Exe= under [MythixLoader]", ini_path);
+        free(extra);
+        return 1;
+    }
+    mlog(L"Config: %ls", ini_path);
 
     g_debug = g_debug || cfg.debug;
 

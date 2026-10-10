@@ -1,7 +1,7 @@
 CC64 = x86_64-w64-mingw32-gcc
 CC32 = i686-w64-mingw32-gcc
-CFLAGS = -O2 -Wall
-LDFLAGS = -lshlwapi
+CFLAGS = -O2 -Wall -Wextra -municode
+LDFLAGS = -s
 OUT = ..
 
 all: $(OUT)/mythix_loader.exe $(OUT)/mythix_loader_32.exe
