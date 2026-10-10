@@ -11,6 +11,11 @@
  * passed on to the game after ExeCommandLine, so per-game launch args set in the
  * Mythix launcher (e.g. -dx11) reach it.
  *
+ * v1.3: no longer points its DLL search at a copied steamclient folder. The
+ *       loader never loads steamclient itself, and the game's steam_api finds
+ *       the running Steam's own steamclient; with the "/home/..." paths profiles
+ *       use under Wine the SetDllDirectory call never even ran. The
+ *       SteamClient*Dll/So, ForceArch and NoInject keys are now ignored.
  * v1.2: no longer copies steamclient dll/so files into the run directory at
  *       launch (nothing used those copies); forwards extra arguments to the game.
  *
@@ -39,16 +44,10 @@ typedef struct {
     char exe_run_dir[MAX_PATH_W];
     char exe_cmd_line[MAX_PATH_W];
     char app_id[64];
-    char steamclient_dll[MAX_PATH_W];
-    char steamclient64_dll[MAX_PATH_W];
-    char steamclient_so[MAX_PATH_W];
-    char steamclient64_so[MAX_PATH_W];
     char extra_dlls[MAX_PATH_W];
     char env_vars[MAX_PATH_W * 4];
     int  persist;
     int  debug;
-    int  force_arch;   /* 0 = auto, 32, 64 */
-    int  no_inject;
 } Config;
 
 static void trim(char *s) {
@@ -99,16 +98,12 @@ static int read_ini(const char *path, Config *cfg) {
         else if (_stricmp(key, "ExeRunDir") == 0)        strncpy(cfg->exe_run_dir, val, sizeof(cfg->exe_run_dir) - 1);
         else if (_stricmp(key, "ExeCommandLine") == 0)   strncpy(cfg->exe_cmd_line, val, sizeof(cfg->exe_cmd_line) - 1);
         else if (_stricmp(key, "AppId") == 0)            strncpy(cfg->app_id, val, sizeof(cfg->app_id) - 1);
-        else if (_stricmp(key, "SteamClientDll") == 0)   strncpy(cfg->steamclient_dll, val, sizeof(cfg->steamclient_dll) - 1);
-        else if (_stricmp(key, "SteamClient64Dll") == 0) strncpy(cfg->steamclient64_dll, val, sizeof(cfg->steamclient64_dll) - 1);
-        else if (_stricmp(key, "SteamClientSo") == 0)    strncpy(cfg->steamclient_so, val, sizeof(cfg->steamclient_so) - 1);
-        else if (_stricmp(key, "SteamClient64So") == 0)  strncpy(cfg->steamclient64_so, val, sizeof(cfg->steamclient64_so) - 1);
         else if (_stricmp(key, "ExtraDlls") == 0)        strncpy(cfg->extra_dlls, val, sizeof(cfg->extra_dlls) - 1);
         else if (_stricmp(key, "EnvVars") == 0)          strncpy(cfg->env_vars, val, sizeof(cfg->env_vars) - 1);
         else if (_stricmp(key, "Persist") == 0)          cfg->persist = (val[0] == '1' || _stricmp(val, "true") == 0);
         else if (_stricmp(key, "Debug") == 0)            cfg->debug = (val[0] == '1' || _stricmp(val, "true") == 0);
-        else if (_stricmp(key, "ForceArch") == 0)        cfg->force_arch = atoi(val);
-        else if (_stricmp(key, "NoInject") == 0)         cfg->no_inject = (val[0] == '1' || _stricmp(val, "true") == 0);
+        /* SteamClientDll/SteamClient64Dll/SteamClientSo/SteamClient64So, ForceArch
+         * and NoInject (written by older profiles) are ignored. */
     }
     fclose(f);
     return cfg->exe[0] != '\0';
@@ -137,34 +132,6 @@ static void dbg(const char *fmt, ...) {
     va_end(ap);
 }
 
-/* ── PE detection ──────────────────────────────────────────────────────── */
-
-static int detect_pe_arch(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return 0;
-
-    WORD mz;
-    fread(&mz, 2, 1, f);
-    if (mz != 0x5A4D) { fclose(f); return 0; }
-
-    fseek(f, 0x3C, SEEK_SET);
-    DWORD pe_off;
-    fread(&pe_off, 4, 1, f);
-
-    fseek(f, pe_off, SEEK_SET);
-    DWORD sig;
-    fread(&sig, 4, 1, f);
-    if (sig != 0x00004550) { fclose(f); return 0; }
-
-    WORD machine;
-    fread(&machine, 2, 1, f);
-    fclose(f);
-
-    if (machine == 0x014C) return 32;
-    if (machine == 0x8664) return 64;
-    return 0;
-}
-
 /* ── Environment setup ─────────────────────────────────────────────────── */
 
 static void set_env_vars(Config *cfg) {
@@ -191,29 +158,6 @@ static void set_env_vars(Config *cfg) {
             }
             tok = strtok(NULL, ";");
         }
-    }
-}
-
-/* ── DLL directory setup ───────────────────────────────────────────────── */
-
-/* Point this process's DLL search at the configured steamclient folder. Nothing
- * is copied anywhere — older versions also copied the steamclient dll/so files
- * into the run directory at every launch, and those copies weren't used. */
-static void setup_dll_redirect(Config *cfg, int arch) {
-    const char *dll_path = (arch == 64) ? cfg->steamclient64_dll : cfg->steamclient_dll;
-    if (!dll_path[0]) {
-        mlog("Warning: no steamclient DLL configured for %d-bit", arch);
-        return;
-    }
-
-    char dir[MAX_PATH_W];
-    strncpy(dir, dll_path, sizeof(dir) - 1);
-    dir[sizeof(dir) - 1] = '\0';
-    PathRemoveFileSpecA(dir);
-
-    if (dir[0]) {
-        SetDllDirectoryA(dir);
-        dbg("SetDllDirectory: %s", dir);
     }
 }
 
@@ -349,7 +293,7 @@ static DWORD launch_game(Config *cfg, int extra_argc, char **extra_argv) {
 /* ── Main ──────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
-    mlog("Mythix Loader v1.2");
+    mlog("Mythix Loader v1.3");
 
     /* Find our own directory for the ini */
     char self_dir[MAX_PATH_W];
@@ -389,24 +333,8 @@ int main(int argc, char *argv[]) {
 
     g_debug = g_debug || cfg.debug;
 
-    /* Detect game architecture */
-    int arch = cfg.force_arch;
-    if (!arch) {
-        arch = detect_pe_arch(cfg.exe);
-        if (!arch) {
-            mlog("Warning: could not detect PE arch, assuming 64-bit");
-            arch = 64;
-        }
-    }
-    dbg("Target arch: %d-bit", arch);
-
     /* Set up environment */
     set_env_vars(&cfg);
-
-    /* Redirect steamclient DLLs */
-    if (!cfg.no_inject) {
-        setup_dll_redirect(&cfg, arch);
-    }
 
     /* Load any extra DLLs */
     load_extra_dlls(&cfg);
