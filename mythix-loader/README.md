@@ -31,7 +31,7 @@ mythix-loader --games                      # installed titles in your Steam libr
 mythix-loader "<install dir>"              # create/refresh a profile
 mythix-loader "<install dir>" --dry-run    # show the plan, write nothing
 mythix-loader "<install dir>" --exe bin/Game.exe --name mygame
-mythix-loader --launch-info 1091500        # Steam's launch entries for an appid
+mythix-loader --launch-info appid          # Steam's launch entries for an appid
 mythix-loader --list                       # existing profiles
 mythix-loader --setup                      # check loader exes + Steam install
 ```
