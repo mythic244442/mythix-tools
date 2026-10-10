@@ -7,7 +7,7 @@ Does NOT modify game files — all loader files live in ~/.mythix/loader_profile
 Profiles launch games you own, through the real steamclient, with Steam running.
 
 Usage:
-    mythix-loader <game_dir> [--appid APPID] [--exe EXE] [--name NAME] [--dry-run] [--json]
+    mythix-loader <game_dir> [--appid APPID] [--exe EXE] [--name NAME] [--dry-run] [--json] [--require-appid]
     mythix-loader --games [--all]
     mythix-loader --launch-info APPID
     mythix-loader --list
@@ -791,8 +791,11 @@ def find_compatdata(appid, steam_dir=None):
     return None
 
 
-def create_profile(game_dir, appid=None, target_exe=None, profile_name=None, dry_run=False):
-    """Plan (and, unless dry_run, write) a loader profile. Returns the plan dict."""
+def create_profile(game_dir, appid=None, target_exe=None, profile_name=None, dry_run=False,
+                   require_appid=False):
+    """Plan (and, unless dry_run, write) a loader profile. Returns the plan dict.
+    With require_appid, a game whose appid can't be found is an error and
+    nothing is written (instead of a profile with AppId=0)."""
     if not JSON_MODE:
         print(BANNER)
 
@@ -898,6 +901,8 @@ def create_profile(game_dir, appid=None, target_exe=None, profile_name=None, dry
     if appid and appid != "0":
         log(f"Steam library match: {game_name or '?'} (appid {appid})")
     else:
+        if require_appid:
+            error("Couldn't find this game's Steam appid — pass --appid")
         warn("Game not found in your Steam library — launching needs an owned,")
         warn("installed title. Set --appid manually if you know it.")
         appid = "0"
@@ -1258,6 +1263,8 @@ Examples:
                         help="Print one JSON result object to stdout (human output goes to stderr)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Plan the profile (appid, launch target, paths) without writing anything")
+    parser.add_argument("--require-appid", action="store_true",
+                        help="Fail without writing anything if the appid can't be found")
     parser.add_argument("--loader-dir", metavar="DIR",
                         help="Directory holding mythix_loader.exe / mythix_loader_32.exe")
     args = parser.parse_args()
@@ -1296,7 +1303,8 @@ Examples:
         sys.stdout = sys.stderr
         try:
             plan = create_profile(game_dir, appid=args.appid, target_exe=args.target_exe,
-                                  profile_name=args.profile_name, dry_run=args.dry_run)
+                                  profile_name=args.profile_name, dry_run=args.dry_run,
+                                  require_appid=args.require_appid)
         except SystemExit:
             raise
         except Exception as e:  # never leave the launcher without a JSON answer
@@ -1308,7 +1316,8 @@ Examples:
         return
 
     plan = create_profile(game_dir, appid=args.appid, target_exe=args.target_exe,
-                          profile_name=args.profile_name, dry_run=args.dry_run)
+                          profile_name=args.profile_name, dry_run=args.dry_run,
+                          require_appid=args.require_appid)
     if args.dry_run:
         print()
         log("Dry run — nothing was written:")

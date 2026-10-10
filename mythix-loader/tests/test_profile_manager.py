@@ -347,6 +347,16 @@ class CliTests(ProfileTestCase):
         self.assertEqual(plan["appid"], "480")
         self.assertEqual(plan["run_dir"], inst)
 
+    def test_require_appid_refuses_and_writes_nothing(self):
+        game = os.path.join(self.home, "Elsewhere", "Unknown Game")
+        make_pe(os.path.join(game, "game.exe"))
+        r = self.run_cli(game, "--json", "--require-appid")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("appid", json.loads(r.stdout)["error"])
+        self.assertFalse(os.path.exists(os.path.join(ml.PROFILES_DIR, "unknown-game")))
+        r = self.run_cli(game, "--json")                # without the flag: AppId=0 profile
+        self.assertEqual(json.loads(r.stdout)["appid"], "0")
+
     def test_appid_must_be_numeric(self):
         inst = self.steam.install(480, "Spacewar", "Spacewar")
         make_pe(os.path.join(inst, "Spacewar.exe"))

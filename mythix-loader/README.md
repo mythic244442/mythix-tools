@@ -37,7 +37,9 @@ mythix-loader --setup                      # check loader exes + Steam install
 ```
 
 `--json` prints a single result object on stdout (human output goes to
-stderr). The Mythix launcher uses it for profile creation.
+stderr). The Mythix launcher uses it for profile creation. `--require-appid`
+makes it fail, writing nothing, when the game's appid can't be found, instead
+of creating a profile with `AppId=0`.
 
 Profiles live in `~/.mythix/loader_profiles/<name>/`. The Mythix launcher
 launches them itself. By hand:
