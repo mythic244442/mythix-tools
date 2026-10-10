@@ -12,6 +12,9 @@
  * Mythix launcher (e.g. -dx11) reach it. Everything after "--" goes to the game
  * as-is, so a game can still be handed its own --debug.
  *
+ * v1.4: Persist waits for every process the game starts, not just the exe the
+ *       ini names, so games that start through a small launcher exe are
+ *       waited for properly. WaitForChildren=0 restores the exe-only wait.
  * v1.3: Unicode throughout. The ini is read as UTF-8 (what mythix-loader writes;
  *       a BOM, a UTF-16 ini saved by Notepad or a legacy ANSI ini work too) and
  *       the game is started with the wide Windows APIs, so paths with non-ASCII
@@ -123,6 +126,7 @@ typedef struct {
     wchar_t extra_dlls[MAX_PATH_W];
     wchar_t env_vars[MAX_PATH_W * 4];
     int     persist;
+    int     wait_children;
     int     debug;
 } Config;
 
@@ -222,6 +226,7 @@ static int read_ini(const wchar_t *path, Config *cfg) {
     if (!text) return -1;
 
     memset(cfg, 0, sizeof(*cfg));
+    cfg->wait_children = 1;
     int in_section = 0;
     wchar_t *next = text;
     while (next) {
@@ -258,6 +263,7 @@ static int read_ini(const wchar_t *path, Config *cfg) {
         else if (_wcsicmp(key, L"ExtraDlls") == 0)      SET(extra_dlls);
         else if (_wcsicmp(key, L"EnvVars") == 0)        SET(env_vars);
         else if (_wcsicmp(key, L"Persist") == 0)        cfg->persist = parse_bool(val);
+        else if (_wcsicmp(key, L"WaitForChildren") == 0) cfg->wait_children = parse_bool(val);
         else if (_wcsicmp(key, L"Debug") == 0)          cfg->debug = parse_bool(val);
         /* SteamClientDll/SteamClient64Dll/SteamClientSo/SteamClient64So, ForceArch
          * and NoInject (written by older profiles) are ignored. */
@@ -379,6 +385,128 @@ static int append_arg(wchar_t *buf, size_t cap, const wchar_t *arg) {
     return 1;
 }
 
+/* ── Waiting for the game ──────────────────────────────────────────────── */
+
+/* Persist with WaitForChildren=1 waits for every process the game starts, not
+ * just the exe the ini names: plenty of games start through a small launcher
+ * exe that spawns the real game and exits at once. The game is created
+ * suspended and put in a job object before it runs, so all its descendants
+ * are counted, and the job's completion port reports when the last one is
+ * gone. The job sets no limits and kills nothing (the game keeps running if
+ * the loader goes away), and a process that asks to break away may. */
+typedef struct {
+    HANDLE job;
+    HANDLE port;
+    DWORD  pids[256];               /* live processes, for the waiting message */
+    int    n_pids;
+} ProcessTree;
+
+static void tree_close(ProcessTree *t) {
+    if (t->port) CloseHandle(t->port);
+    if (t->job) CloseHandle(t->job);
+    t->port = t->job = NULL;
+}
+
+static int tree_open(ProcessTree *t) {
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+    JOBOBJECT_ASSOCIATE_COMPLETION_PORT acp;
+    ZeroMemory(&limits, sizeof(limits));
+    /* Without this, CreateProcess(CREATE_BREAKAWAY_FROM_JOB) in the game fails.
+     * It is an extended limit: the basic information class rejects it. */
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    t->job = CreateJobObjectW(NULL, NULL);
+    t->port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
+    acp.CompletionKey = t->job;
+    acp.CompletionPort = t->port;
+    if (t->job && t->port &&
+        SetInformationJobObject(t->job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) &&
+        SetInformationJobObject(t->job, JobObjectAssociateCompletionPortInformation, &acp, sizeof(acp)))
+        return 1;
+    mlog(L"Warning: can't follow the processes the game starts (%ls); waiting for the exe only",
+         err_text(GetLastError()));
+    tree_close(t);
+    return 0;
+}
+
+/* Processes still in the job, or -1 if the job can't be queried. */
+static long tree_active(const ProcessTree *t) {
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info;
+    if (!QueryInformationJobObject(t->job, JobObjectBasicAccountingInformation,
+                                   &info, sizeof(info), NULL))
+        return -1;
+    return (long)info.ActiveProcesses;
+}
+
+static const wchar_t *process_image(DWORD pid) {
+    static wchar_t path[MAX_PATH_W];
+    DWORD len = MAX_PATH_W;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    path[0] = L'\0';
+    if (h) {
+        if (!QueryFullProcessImageNameW(h, 0, path, &len)) path[0] = L'\0';
+        CloseHandle(h);
+    }
+    return path[0] ? path : L"?";
+}
+
+static void tree_track(ProcessTree *t, DWORD pid, int alive) {
+    for (int i = 0; i < t->n_pids; i++) {
+        if (t->pids[i] == pid) {
+            if (!alive) t->pids[i] = t->pids[--t->n_pids];
+            return;
+        }
+    }
+    if (alive && t->n_pids < (int)ARRAYSIZE(t->pids)) t->pids[t->n_pids++] = pid;
+}
+
+/* Returns once every process in the job has exited. */
+static void tree_wait(ProcessTree *t, const PROCESS_INFORMATION *pi) {
+    long live = 0;                  /* processes in the job, from its messages */
+    for (;;) {
+        DWORD msg;
+        ULONG_PTR key;
+        LPOVERLAPPED ov;
+        if (!GetQueuedCompletionStatus(t->port, &msg, &key, &ov, 1000)) {
+            /* Job messages aren't guaranteed to arrive, so once a second
+             * also check the count directly. If the job can't tell us, fall
+             * back to waiting for the exe. */
+            long n = (GetLastError() == WAIT_TIMEOUT) ? tree_active(t) : -1;
+            if (n == 0) return;
+            if (n < 0) {
+                WaitForSingleObject(pi->hProcess, INFINITE);
+                return;
+            }
+            continue;
+        }
+        if (key != (ULONG_PTR)t->job) continue;
+        DWORD pid = (DWORD)(ULONG_PTR)ov;
+        switch (msg) {
+        case JOB_OBJECT_MSG_NEW_PROCESS:
+            live++;
+            tree_track(t, pid, 1);
+            /* Too early to name it: the new process isn't fully set up yet. */
+            if (pid != pi->dwProcessId) dbg(L"Game started process %lu", pid);
+            break;
+        case JOB_OBJECT_MSG_EXIT_PROCESS:
+        case JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS:
+            live--;
+            tree_track(t, pid, 0);
+            if (pid != pi->dwProcessId) {
+                dbg(L"Process %lu exited: %ls", pid, process_image(pid));
+            } else if (live > 0) {
+                /* Say what is keeping the loader around, in case it never ends. */
+                mlog(L"Game exe exited; still waiting for %ld process(es) it started:", live);
+                for (int i = 0; i < t->n_pids; i++)
+                    mlog(L"  PID %lu: %ls", t->pids[i], process_image(t->pids[i]));
+                mlog(L"(WaitForChildren=0 in the ini makes Persist wait for the exe only)");
+            }
+            break;
+        case JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO:
+            return;
+        }
+    }
+}
+
 static DWORD launch_game(Config *cfg, int extra_argc, wchar_t **extra_argv) {
     /* Exe and ExeCommandLine are each capped at MAX_PATH_W, so this always fits. */
     static wchar_t cmd_line[MAX_CMD_LINE];
@@ -411,12 +539,16 @@ static DWORD launch_game(Config *cfg, int extra_argc, wchar_t **extra_argv) {
     mlog(L"Launching: %ls", cmd_line);
     mlog(L"Working dir: %ls", run_dir[0] ? run_dir : L"(inherited)");
 
+    ProcessTree tree;
+    ZeroMemory(&tree, sizeof(tree));
+    int track = cfg->persist && cfg->wait_children && tree_open(&tree);
+
     BOOL ok = CreateProcessW(
         NULL,
         cmd_line,
         NULL, NULL,
         FALSE,
-        0,
+        track ? CREATE_SUSPENDED : 0,
         NULL,
         run_dir[0] ? run_dir : NULL,
         &si,
@@ -425,6 +557,7 @@ static DWORD launch_game(Config *cfg, int extra_argc, wchar_t **extra_argv) {
 
     if (!ok) {
         DWORD e = GetLastError();
+        tree_close(&tree);
         mlog(L"Error: could not start the game (%ls)", err_text(e));
         if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND)
             mlog(L"Check Exe= in the ini: is the game still installed there?");
@@ -433,15 +566,35 @@ static DWORD launch_game(Config *cfg, int extra_argc, wchar_t **extra_argv) {
         return 1;
     }
 
+    if (track) {
+        /* It is still suspended: put it in the job before it can start anything. */
+        if (!AssignProcessToJobObject(tree.job, pi.hProcess)) {
+            mlog(L"Warning: can't follow the processes the game starts (%ls); waiting for the exe only",
+                 err_text(GetLastError()));
+            tree_close(&tree);
+            track = 0;
+        }
+        if (ResumeThread(pi.hThread) == (DWORD)-1) {
+            mlog(L"Error: could not start the game (%ls)", err_text(GetLastError()));
+            TerminateProcess(pi.hProcess, 1);
+            tree_close(&tree);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            return 1;
+        }
+    }
+
     mlog(L"Game launched (PID %lu)", pi.dwProcessId);
 
     DWORD exit_code = 0;
     if (cfg->persist) {
-        dbg(L"Waiting for game to exit...");
-        WaitForSingleObject(pi.hProcess, INFINITE);
+        dbg(L"Waiting for the game%ls to exit...", track ? L" and everything it starts" : L"");
+        if (track) tree_wait(&tree, &pi);
+        WaitForSingleObject(pi.hProcess, INFINITE);     /* already done when tracking */
         GetExitCodeProcess(pi.hProcess, &exit_code);
         mlog(L"Game exited (code %lu)", exit_code);
     }
+    tree_close(&tree);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     return exit_code;
@@ -450,7 +603,7 @@ static DWORD launch_game(Config *cfg, int extra_argc, wchar_t **extra_argv) {
 /* ── Main ──────────────────────────────────────────────────────────────── */
 
 int wmain(int argc, wchar_t *argv[]) {
-    mlog(L"Mythix Loader v1.3");
+    mlog(L"Mythix Loader v1.4");
 
     /* Find our own directory for the ini */
     wchar_t self_dir[MAX_PATH_W];

@@ -53,8 +53,13 @@ class LoaderUnderWineTests(unittest.TestCase):
         ini = os.path.join(self.profile, "mythix_loader.ini")
         with open(ini, "wb") as f:
             f.write(raw if raw is not None else ini_text.encode(encoding))
-        r = subprocess.run([WINE, self.stub, *args], env=self.env, capture_output=True, timeout=120)
-        out = r.stdout.decode("utf-8", "replace") + r.stderr.decode("utf-8", "replace")
+        # Output goes to a file, not a pipe: processes the game leaves running
+        # inherit it, and reading a pipe to EOF would wait for them too.
+        with tempfile.TemporaryFile() as log:
+            r = subprocess.run([WINE, self.stub, *args], env=self.env, stdout=log,
+                               stderr=subprocess.STDOUT, timeout=120)
+            log.seek(0)
+            out = log.read().decode("utf-8", "replace")
         seen = dict(line.split("=", 1) for line in out.splitlines() if "=" in line and not line.startswith("["))
         return r.returncode, seen, out
 
@@ -106,6 +111,51 @@ class LoaderUnderWineTests(unittest.TestCase):
         code, _, out = self.run_loader("[Other]\nExe=x\n")
         self.assertEqual(code, 1)
         self.assertIn("has no Exe=", out)
+
+    # ── Persist: the exe starts the "real game" and exits at once ──────────
+
+    def launcher_ini(self, marker, sleep_ms, extra_env="", extra_keys=""):
+        exe = self.game_at("launcher", "game.exe")
+        win_marker = "Z:" + marker.replace("/", "\\")
+        return (f"[MythixLoader]\nExe={exe}\nPersist=1\n{extra_keys}"
+                f"EnvVars=FAKE_SPAWN=1;FAKE_SLEEP_MS={sleep_ms};FAKE_MARKER={win_marker}{extra_env}\n")
+
+    def test_persist_waits_for_processes_the_game_starts(self):
+        marker = os.path.join(self.root, "tree.done")
+        code, seen, out = self.run_loader(self.launcher_ini(marker, 2000))
+        self.assertEqual(seen["SPAWN"], "ok", out)
+        self.assertTrue(os.path.exists(marker), "loader returned before the real game finished\n" + out)
+        self.assertEqual(code, 3, out)                  # the exe's own exit code
+        self.assertIn("still waiting for 1 process(es)", out)
+        self.assertIn("launcher\\game.exe", out)        # names what it waits for
+
+    def test_wait_for_children_off_waits_for_the_exe_only(self):
+        marker = os.path.join(self.root, "exe-only.done")
+        code, seen, out = self.run_loader(self.launcher_ini(marker, 4000, extra_keys="WaitForChildren=0\n"))
+        self.assertEqual(seen["SPAWN"], "ok", out)
+        self.assertEqual(code, 3, out)
+        self.assertFalse(os.path.exists(marker), out)
+
+    def test_game_can_still_put_its_children_in_a_job_of_its_own(self):
+        marker = os.path.join(self.root, "nested.done")
+        code, seen, out = self.run_loader(self.launcher_ini(marker, 2000, ";FAKE_CHILD_JOB=1"))
+        self.assertEqual(seen["CHILD_JOB"], "ok", out)  # nested jobs, as Chromium/CEF use
+        self.assertTrue(os.path.exists(marker), out)
+
+    def test_children_may_break_away(self):
+        marker = os.path.join(self.root, "breakaway.done")
+        code, seen, out = self.run_loader(self.launcher_ini(marker, 4000, ";FAKE_BREAKAWAY=1"))
+        self.assertEqual(seen["SPAWN"], "ok", out)      # would be "failed 5" without BREAKAWAY_OK
+        self.assertEqual(code, 3, out)
+        self.assertFalse(os.path.exists(marker), out)   # it left the job, so not waited for
+
+    def test_no_persist_returns_at_once(self):
+        marker = os.path.join(self.root, "nopersist.done")
+        ini = self.launcher_ini(marker, 4000).replace("Persist=1", "Persist=0")
+        code, seen, out = self.run_loader(ini)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("Warning", out)
+        self.assertFalse(os.path.exists(marker), out)
 
 
 if __name__ == "__main__":

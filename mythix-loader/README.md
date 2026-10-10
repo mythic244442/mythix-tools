@@ -50,9 +50,18 @@ ExeCommandLine=              ; args always passed to the game
 AppId=480                    ; exported as SteamAppId/SteamGameId (0 = not set)
 EnvVars=KEY=VAL;KEY2=VAL2    ; extra environment for the game
 ExtraDlls=                   ; DLLs loaded into the loader process (not the game)
-Persist=1                    ; wait for the game and return its exit code
+Persist=1                    ; wait for the game and return the exe's exit code
+WaitForChildren=1            ; ...and for every process it starts (0 = the exe only)
 Debug=0
 ```
+
+With `Persist=1` the loader waits until the game exe and everything it starts
+have exited, so a launcher exe that starts the real game and quits doesn't end
+the wait early. The game runs in a job object, which only does the counting:
+it sets no limits, nothing gets killed, and the game's own job objects (CEF
+and the like) and `CREATE_BREAKAWAY_FROM_JOB` children work as normal. When the
+exe exits while other processes are still running, the loader lists them. If
+one never exits (a tray helper, say), set `WaitForChildren=0`.
 
 The ini is UTF-8 (a BOM is fine; UTF-16 and legacy ANSI files also load).
 `/home/...` paths work under Wine. Arguments given to the stub are added after
