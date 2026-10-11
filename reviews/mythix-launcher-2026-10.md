@@ -232,11 +232,15 @@ aren't launcher findings, but they decide how games end.
   weak: no folder skip list, and a 0.8 MB `oalinst.exe` in the root beats a
   40 MB `Bin/Game.exe`. Prefer the loader's dry-run `plan.exe` for Steam
   games, or return an error.
-- **Question:** a clone copies only `pfx/`, keeping Proton's absolute symlinks
+- **Answered:** a clone copies only `pfx/`, keeping Proton's absolute symlinks
   into Steam's Proton install, and drops `version`, `config_info` and
-  `tracked_files` (`steam_import.rs:217-239`). Does neutron re-link builtin
-  DLLs in a prefix that has no `version` file? If not, cloned prefixes keep
-  loading Steam's Proton DLLs.
+  `tracked_files` (`steam_import.rs:217-239`). Neutron does use a version
+  file: with none, it treats the prefix as new and re-overlays its own
+  builtin DLLs on first launch, so clones don't stay tied to Steam's Proton.
+  One leftover: a link whose target is gone (that Proton version
+  uninstalled) can't be recognised as a builtin and is left in place. If that
+  ever bites, deleting the clone's links that point outside the prefix
+  before first launch fixes it.
 
 ### Runtime and container
 - **Update detection never works.** `runtime.rs:185` (`current_build_id`).

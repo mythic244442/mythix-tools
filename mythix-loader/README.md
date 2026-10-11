@@ -59,12 +59,48 @@ Exe=/path/to/Game.exe        ; required
 ExeRunDir=/path/to/workdir   ; game's working dir (default: the exe's folder)
 ExeCommandLine=              ; args always passed to the game
 AppId=480                    ; exported as SteamAppId/SteamGameId (0 = not set)
-EnvVars=KEY=VAL;KEY2=VAL2    ; extra environment for the game
-ExtraDlls=                   ; DLLs loaded into the loader process (not the game)
+EnvVars=KEY=VAL;-KEY2        ; extra environment for the game; -NAME removes one
 Persist=1                    ; wait for the game and return the exe's exit code
 WaitForChildren=1            ; ...and for every process it starts (0 = the exe only)
-Debug=0
+SingleInstance=1             ; a second launch waits for the running game instead
+Priority=                    ; idle, belownormal, normal, abovenormal or high
+Affinity=                    ; CPU cores, e.g. 0 or 0,2-3 (or a mask like 0x5)
+RunBefore=                   ; command run (and waited for) before the game
+RunAfter=                    ; command run after the game exits (needs Persist=1)
+LogFile=mythix_loader.log    ; the loader's log, also written here; empty = none
+Debug=0                      ; more detail in the log
+ExtraDlls=                   ; DLLs loaded into the loader process only, NOT the game
 ```
+
+Values can use `%VARS%`, expanded the Windows way (a name that isn't set
+stays as written). Besides the normal environment there are
+`%MYTHIX_PROFILE_DIR%` (the ini's folder), `%MYTHIX_GAME_DIR%` (the exe's
+folder) and `%SteamAppId%`; `EnvVars` entries can use the ones before them.
+Relative paths in `Exe`, `ExeRunDir` and `LogFile` are relative to the ini's
+folder, so a profile can move.
+
+- **LogFile** gets every loader line with a time stamp, overwritten each
+  launch. Useful under the Mythix launcher, which discards the loader's
+  output unless `MYTHIX_CAPTURE_GAME_OUTPUT=1` is set. Exit codes that mean a
+  crash are named, e.g. `0xC0000005 (access violation: the game crashed)`.
+- **SingleInstance** stops a second copy of the same profile while the game
+  is still running. The second launch waits for the running one and then
+  exits without starting anything. Waiting (instead of exiting at once) keeps
+  neutron from treating the second launch as finished and cleaning up the
+  prefix 30 s later. Needs `Persist=1`.
+- **Priority** and **Affinity** apply to the game exe and, while the loader
+  follows the game's processes, to everything it starts. One core
+  (`Affinity=0`) is a classic fix for old games that glitch on many cores.
+  Under Wine the priority class is set, but how much it changes real
+  scheduling depends on your system.
+- **RunBefore** / **RunAfter** run a Windows command line in the game's
+  working directory, with the game's environment, and wait for it. To start
+  something without waiting, use `cmd /c start "" thing.exe`. `RunAfter` only
+  runs if the game launched and `Persist=1`.
+- **ExtraDlls** loads DLLs into the loader process itself, never into the
+  game, so it doesn't change how the game runs. It's only there for
+  troubleshooting the loader (for example, checking a DLL loads in that
+  prefix), and the log says so when it's used.
 
 With `Persist=1` the loader waits until the game exe and the processes it
 starts (and theirs) have exited, so a launcher exe that starts the real game
@@ -107,10 +143,12 @@ gives for that exe, or to the exe's own folder.
 
 Keys from older profiles (`SteamClientDll`, `SteamClient64Dll`,
 `SteamClientSo`, `SteamClient64So`, `ForceArch`, `NoInject`) are ignored.
-Re-running `mythix-loader` on a game refreshes its profile: it writes the new
-ini, copies in the current stub and removes the old `client/` steamclient
-copies. That's how an existing profile picks up a loader update; editing an
-old profile's ini doesn't update its stub.
+Re-running `mythix-loader` on a game refreshes its profile: it rewrites `Exe`,
+`ExeRunDir` and `AppId` from the game, keeps every other setting already in
+the ini (and keys it doesn't know, at the end), copies in the current stub and
+removes the old `client/` steamclient copies. That's how an existing profile
+picks up a loader update; editing an old profile's ini doesn't update its
+stub.
 
 ## Building and testing
 

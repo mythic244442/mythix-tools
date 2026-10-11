@@ -108,16 +108,17 @@ class LoaderUnderWine:
         with open(ini, "wb") as f:
             f.write(raw if raw is not None else ini_text.encode(encoding))
 
-    def run_loader(self, ini_text, *args, encoding="utf-8", raw=None):
+    def run_loader(self, ini_text, *args, encoding="utf-8", raw=None, env=None):
         """Returns (exit code, KEY=VALUE lines the game printed, full output, log path)."""
-        self.write_ini(ini_text, encoding, raw)
+        if ini_text is not None or raw is not None:
+            self.write_ini(ini_text, encoding, raw)
         # Output goes to a file, not a pipe: processes the game leaves running
         # inherit it, and reading a pipe to EOF would wait for them too.
         log = os.path.join(self.dir, f"{uuid.uuid4().hex}.log")
         with open(log, "wb") as f:
             try:
-                r = subprocess.run([self.wine, self.stub, *args], env=self.env, stdout=f,
-                                   stderr=subprocess.STDOUT, timeout=120)
+                r = subprocess.run([self.wine, self.stub, *args], env=dict(self.env, **(env or {})),
+                                   stdout=f, stderr=subprocess.STDOUT, timeout=120)
                 code = r.returncode
             except subprocess.TimeoutExpired:
                 code = None
@@ -197,9 +198,9 @@ class LoaderUnderWine:
         self.assertEqual(seen.get("SPAWN"), "ok", out)
         self.assertTrue(os.path.exists(marker), "loader returned before the real game finished\n" + out)
         self.assertEqual(code, 3, out)                  # the exe's own exit code
-        self.assertIn("Game exe exited (code 3); still waiting for 1 process(es)", out)
+        self.assertIn("Game exe exited with code 3; still waiting for 1 process(es)", out)
         self.assertIn("launcher\\game.exe", out)        # names what it waits for
-        self.assertIn("returning the exe's exit code 3", out)
+        self.assertIn("returning the exe's exit code, 3", out)
         self.assertNotIn("IN_JOB=0", out)               # launcher and game both counted
 
     def test_wait_for_children_off_waits_for_the_exe_only(self):
@@ -300,6 +301,100 @@ class LoaderUnderWine:
         self.assertNotIn("Warning", out)
         self.assertFalse(os.path.exists(marker), out)
         self.assertTrue(self.wait_for(marker), "the game never ran to completion")
+
+
+    # ── v1.5 keys ───────────────────────────────────────────────────────────
+
+    def profile_dir(self):
+        return os.path.dirname(self.stub)
+
+    def test_log_file_is_written_next_to_the_ini(self):
+        exe = self.game_at("plain", "game.exe")
+        log_name = f"{self._testMethodName}.log"
+        code, _, out, _ = self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nLogFile={log_name}\n")
+        self.assertEqual(code, 7, out)
+        with open(os.path.join(self.profile_dir(), log_name), encoding="utf-8") as f:
+            logged = f.read()
+        self.assertRegex(logged, r"^\d\d:\d\d:\d\d\.\d{3} \[mythix-loader\] Mythix Loader v1\.5")
+        self.assertIn("Game exited with code 7", logged)
+
+    def test_crash_codes_are_named(self):
+        exe = self.game_at("plain", "game.exe")
+        _, _, out, _ = self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nEnvVars=FAKE_EXIT=C0000005\n")
+        self.assertIn("Game exited with code 0xC0000005 (access violation: the game crashed)", out)
+
+    def test_vars_relative_paths_and_env_removal(self):
+        rel = os.path.join(self._testMethodName, "fg.exe")
+        os.makedirs(os.path.join(self.profile_dir(), self._testMethodName), exist_ok=True)
+        shutil.copy(self.fakegame, os.path.join(self.profile_dir(), rel))
+        ini = ("[MythixLoader]\n"
+               f"Exe={rel.replace(os.sep, '/')}\n"
+               "ExeCommandLine=%MYTHIX_PROFILE_DIR%\n"
+               "AppId=480\n"
+               "EnvVars=A=1;MYTHIX_TEST=%MYTHIX_GAME_DIR%|%A%|%SteamAppId%\n"
+               "Persist=1\n")
+        code, seen, out, _ = self.run_loader(ini)
+        self.assertEqual(code, 7, out)
+        self.assertTrue(seen.get("ARG1", "").endswith("\\profile"), out)
+        self.assertTrue(seen.get("MYTHIX_TEST", "").endswith(f"\\{self._testMethodName}|1|480"), out)
+        self.assertTrue(seen.get("CWD", "").endswith(f"\\{self._testMethodName}"), out)
+        _, seen, out, _ = self.run_loader(ini.replace("EnvVars=A=1;MYTHIX_TEST=%MYTHIX_GAME_DIR%|%A%|%SteamAppId%",
+                                                      "EnvVars=-MYTHIX_TEST"),
+                                          env={"MYTHIX_TEST": "from outside"})
+        self.assertEqual(seen.get("MYTHIX_TEST"), "<unset>", out)
+
+    def test_priority_and_affinity_reach_the_game_and_its_children(self):
+        marker = self.marker()
+        code, seen, out, log = self.run_loader(self.launcher_ini(marker, 1000, extra_keys="Priority=high\nAffinity=0\n"))
+        self.assertTrue(os.path.exists(marker), out)
+        lines = self.read(log).splitlines()
+        # launcher and its child: HIGH_PRIORITY_CLASS and CPU 0 for both
+        self.assertEqual([l for l in lines if l.startswith("PRIORITY=")][0], "PRIORITY=0x80", out)
+        # the child is set a moment after it starts, so check what it ends with
+        self.assertEqual([l for l in lines if l.startswith("PRIORITY_END=")], ["PRIORITY_END=0x80"], out)
+        self.assertEqual([l for l in lines if l.startswith("AFFINITY=")], ["AFFINITY=0x1"] * 2, out)
+
+    def test_bad_priority_and_affinity_only_warn(self):
+        exe = self.game_at("plain", "game.exe")
+        code, _, out, _ = self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nPriority=turbo\nAffinity=x\n")
+        self.assertEqual(code, 7, out)
+        self.assertIn("Warning: Priority=turbo", out)
+        self.assertIn("Warning: Affinity=x", out)
+
+    def test_run_before_and_after(self):
+        exe = self.game_at("plain", "game.exe")
+        ini = (f"[MythixLoader]\nExe={exe}\nPersist=1\n"
+               f'RunBefore="{self.fakegame}" before\nRunAfter="{self.fakegame}" after\n')
+        code, _, out, _ = self.run_loader(ini)
+        self.assertEqual(code, 7, out)
+        order = [out.find(t) for t in ("ARG1=before", "Game launched", "Game exited", "ARG1=after")]
+        self.assertTrue(-1 < order[0] < order[1] < order[2] < order[3], out)
+        self.assertIn("RunBefore exited with code 7", out)
+        _, _, out, _ = self.run_loader(ini.replace("Persist=1", "Persist=0"))
+        self.assertIn("RunAfter needs Persist=1", out)
+        self.assertNotIn("ARG1=after", out)
+
+    def test_single_instance_waits_for_the_running_copy(self):
+        exe = self.game_at("plain", "game.exe")
+        marker = self.marker()
+        win_marker = "Z:" + marker.replace("/", "\\")
+        self.write_ini(f"[MythixLoader]\nExe={exe}\nPersist=1\nSingleInstance=1\n"
+                       f"EnvVars=FAKE_SLEEP_MS=4000;FAKE_MARKER={win_marker}\n")
+        first_log = os.path.join(self.dir, "first.log")
+        with open(first_log, "wb") as f:
+            first = subprocess.Popen([self.wine, self.stub], env=self.env, stdout=f, stderr=subprocess.STDOUT)
+            try:
+                deadline = time.monotonic() + 60
+                while "Game launched" not in self.read(first_log) and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                code, _, out, _ = self.run_loader(None)         # same ini, second launch
+            finally:
+                first.wait(timeout=120)
+        self.assertEqual(code, 0, out)
+        self.assertIn("already running; not starting a second copy", out)
+        self.assertNotIn("Launching:", out)
+        self.assertTrue(os.path.exists(marker), "the second launch returned before the first game ended")
+        self.assertEqual(self.read(first_log).count("Game launched"), 1)
 
 
 class LoaderUnderWine64(LoaderUnderWine, unittest.TestCase):

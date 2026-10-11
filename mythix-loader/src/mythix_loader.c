@@ -12,6 +12,12 @@
  * Mythix launcher (e.g. -dx11) reach it. Everything after "--" goes to the game
  * as-is, so a game can still be handed its own --debug.
  *
+ * v1.5: more ini keys: LogFile (the log also goes to a file), SingleInstance
+ *       (a second launch waits for the running game instead of starting
+ *       another copy), Priority and Affinity, RunBefore/RunAfter commands,
+ *       %VARS% in values (plus MYTHIX_PROFILE_DIR / MYTHIX_GAME_DIR), paths
+ *       relative to the ini's folder, and -NAME in EnvVars to remove a
+ *       variable. Crash exit codes are named in the log.
  * v1.4: Persist waits for every process the game starts, not just the exe the
  *       ini names, so games that start through a small launcher exe are
  *       waited for properly. WaitForChildren=0 restores the exe-only wait.
@@ -54,6 +60,24 @@
 
 static int g_debug = 0;
 
+/* LogFile: lines logged before the file is open are kept in memory and
+ * written first, so the file has the whole run. */
+static HANDLE g_log = INVALID_HANDLE_VALUE;
+static int g_log_pending = 1;
+static wchar_t *g_early;
+static size_t g_early_len, g_early_cap;
+
+static void write_utf8(HANDLE h, const wchar_t *s) {
+    DWORD n;
+    int len = WideCharToMultiByte(CP_UTF8, 0, s, -1, NULL, 0, NULL, NULL);
+    if (len <= 1) return;
+    char *buf = malloc((size_t)len);
+    if (!buf) return;
+    WideCharToMultiByte(CP_UTF8, 0, s, -1, buf, len, NULL, NULL);
+    WriteFile(h, buf, (DWORD)(len - 1), &n, NULL);
+    free(buf);
+}
+
 /* Write to stderr: WriteConsoleW on a real console, UTF-8 bytes otherwise
  * (pipes, and the unix stderr Wine hands through). */
 static void put_err(const wchar_t *s) {
@@ -64,13 +88,34 @@ static void put_err(const wchar_t *s) {
         WriteConsoleW(h, s, (DWORD)wcslen(s), &n, NULL);
         return;
     }
-    int len = WideCharToMultiByte(CP_UTF8, 0, s, -1, NULL, 0, NULL, NULL);
-    if (len <= 1) return;
-    char *buf = malloc((size_t)len);
-    if (!buf) return;
-    WideCharToMultiByte(CP_UTF8, 0, s, -1, buf, len, NULL, NULL);
-    WriteFile(h, buf, (DWORD)(len - 1), &n, NULL);
-    free(buf);
+    write_utf8(h, s);
+}
+
+/* The log file gets each line with a time stamp. */
+static void put_log(const wchar_t *s) {
+    wchar_t line[64];
+    SYSTEMTIME t;
+    if (g_log == INVALID_HANDLE_VALUE && !g_log_pending) return;
+    GetLocalTime(&t);
+    _snwprintf(line, ARRAYSIZE(line), L"%02u:%02u:%02u.%03u ",
+               t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    line[ARRAYSIZE(line) - 1] = L'\0';
+    if (g_log != INVALID_HANDLE_VALUE) {
+        write_utf8(g_log, line);
+        write_utf8(g_log, s);
+        return;
+    }
+    size_t need = g_early_len + wcslen(line) + wcslen(s) + 1;
+    if (need > g_early_cap) {
+        size_t cap = need * 2;
+        wchar_t *grown = realloc(g_early, cap * sizeof(wchar_t));
+        if (!grown) return;
+        g_early = grown;
+        g_early_cap = cap;
+    }
+    wcscpy(g_early + g_early_len, line);
+    wcscat(g_early + g_early_len, s);
+    g_early_len = wcslen(g_early);
 }
 
 /* Formats use the wide printf rules: %ls for wide strings. */
@@ -85,6 +130,7 @@ static void vlog(const wchar_t *tag, const wchar_t *fmt, va_list ap) {
     msg[len++] = L'\n';
     msg[len] = L'\0';
     put_err(msg);
+    put_log(msg);
 }
 
 static void mlog(const wchar_t *fmt, ...) {
@@ -126,8 +172,14 @@ typedef struct {
     wchar_t app_id[64];
     wchar_t extra_dlls[MAX_PATH_W];
     wchar_t env_vars[MAX_PATH_W * 4];
+    wchar_t run_before[MAX_PATH_W];
+    wchar_t run_after[MAX_PATH_W];
+    wchar_t log_file[MAX_PATH_W];
+    wchar_t priority[32];
+    wchar_t affinity[256];
     int     persist;
     int     wait_children;
+    int     single_instance;
     int     debug;
 } Config;
 
@@ -272,6 +324,12 @@ static int read_ini(const wchar_t *path, Config *cfg) {
         else if (_wcsicmp(key, L"AppId") == 0)          SET(app_id);
         else if (_wcsicmp(key, L"ExtraDlls") == 0)      SET(extra_dlls);
         else if (_wcsicmp(key, L"EnvVars") == 0)        SET(env_vars);
+        else if (_wcsicmp(key, L"RunBefore") == 0)      SET(run_before);
+        else if (_wcsicmp(key, L"RunAfter") == 0)       SET(run_after);
+        else if (_wcsicmp(key, L"LogFile") == 0)        SET(log_file);
+        else if (_wcsicmp(key, L"Priority") == 0)       SET(priority);
+        else if (_wcsicmp(key, L"Affinity") == 0)       SET(affinity);
+        else if (_wcsicmp(key, L"SingleInstance") == 0) cfg->single_instance = parse_bool(key, val, 0);
         else if (_wcsicmp(key, L"Persist") == 0)        cfg->persist = parse_bool(key, val, 0);
         else if (_wcsicmp(key, L"WaitForChildren") == 0) cfg->wait_children = parse_bool(key, val, 1);
         else if (_wcsicmp(key, L"Debug") == 0)          cfg->debug = parse_bool(key, val, 0);
@@ -295,6 +353,213 @@ static void parent_dir(wchar_t *path) {
         sep[1] = L'\0';                         /* keep the root: "/" or "C:\" */
     else
         *sep = L'\0';
+}
+
+/* ── Values: %VARS% and relative paths ─────────────────────────────────── */
+
+/* Expand %VARS% in place, Windows style: names that aren't set stay as they
+ * are, so a lone % in a path is harmless. */
+static void expand_vars(wchar_t *s, size_t cap, const wchar_t *key) {
+    if (!wcschr(s, L'%')) return;
+    wchar_t *out = malloc(cap * sizeof(wchar_t));
+    if (!out) return;
+    DWORD n = ExpandEnvironmentStringsW(s, out, (DWORD)cap);
+    if (n == 0 || n > cap)
+        mlog(L"Warning: %ls is too long once %%VARS%% are expanded; using it as written", key);
+    else
+        wcscpy(s, out);
+    free(out);
+}
+
+static int is_relative(const wchar_t *p) {
+    return p[0] && p[0] != L'\\' && p[0] != L'/' && p[1] != L':';
+}
+
+/* A relative path in the ini means relative to the ini's own folder. */
+static void resolve_path(wchar_t *p, size_t cap, const wchar_t *base, const wchar_t *key) {
+    wchar_t joined[MAX_PATH_W];
+    if (!is_relative(p)) return;
+    int n = _snwprintf(joined, ARRAYSIZE(joined), L"%ls\\%ls", base, p);
+    if (n < 0 || (size_t)n >= cap || (size_t)n >= ARRAYSIZE(joined)) {
+        mlog(L"Warning: %ls is too long with the ini's folder in front; using it as written", key);
+        return;
+    }
+    for (wchar_t *c = joined + wcslen(base); *c; c++)
+        if (*c == L'/') *c = L'\\';
+    wcscpy(p, joined);
+}
+
+/* ── Priority and affinity ─────────────────────────────────────────────── */
+
+/* idle, belownormal, normal, abovenormal, high (spaces, - and _ ignored). */
+static DWORD priority_class(const wchar_t *v) {
+    static const struct { const wchar_t *name; DWORD cls; } map[] = {
+        { L"idle", IDLE_PRIORITY_CLASS }, { L"belownormal", BELOW_NORMAL_PRIORITY_CLASS },
+        { L"normal", NORMAL_PRIORITY_CLASS }, { L"abovenormal", ABOVE_NORMAL_PRIORITY_CLASS },
+        { L"high", HIGH_PRIORITY_CLASS },
+    };
+    wchar_t name[32];
+    size_t n = 0;
+    if (!v[0]) return 0;
+    for (const wchar_t *p = v; *p && n < ARRAYSIZE(name) - 1; p++)
+        if (*p != L' ' && *p != L'-' && *p != L'_') name[n++] = *p;
+    name[n] = L'\0';
+    for (size_t i = 0; i < ARRAYSIZE(map); i++)
+        if (_wcsicmp(name, map[i].name) == 0) return map[i].cls;
+    mlog(L"Warning: Priority=%ls isn't idle/belownormal/normal/abovenormal/high; ignored", v);
+    return 0;
+}
+
+/* "0", "0,2-3" (CPU numbers) or "0x5" (a mask). 0 = not set or invalid. */
+static DWORD_PTR affinity_mask(const wchar_t *v) {
+    const unsigned bits = (unsigned)(sizeof(DWORD_PTR) * 8);
+    DWORD_PTR mask = 0;
+    wchar_t *end;
+    if (!v[0]) return 0;
+    if (v[0] == L'0' && (v[1] == L'x' || v[1] == L'X')) {
+        mask = (DWORD_PTR)wcstoull(v + 2, &end, 16);
+        if (*trim(end) || !mask) goto bad;
+        return mask;
+    }
+    for (const wchar_t *p = v; *p; ) {
+        while (*p == L' ' || *p == L',') p++;
+        if (!*p) break;
+        unsigned long lo = wcstoul(p, &end, 10), hi = lo;
+        if (end == p) goto bad;
+        p = end;
+        while (*p == L' ') p++;
+        if (*p == L'-') {
+            const wchar_t *q = p + 1;
+            hi = wcstoul(q, &end, 10);
+            if (end == q || hi < lo) goto bad;
+            p = end;
+        }
+        if (hi >= bits) {
+            mlog(L"Warning: Affinity=%ls names CPU %lu; this build only handles 0-%u", v, hi, bits - 1);
+            goto bad_quiet;
+        }
+        for (unsigned long c = lo; c <= hi; c++) mask |= (DWORD_PTR)1 << c;
+        while (*p == L' ') p++;
+        if (*p && *p != L',') goto bad;
+    }
+    if (mask) return mask;
+bad:
+    mlog(L"Warning: Affinity=%ls isn't a CPU list like 0,2-3 or a mask like 0x5; ignored", v);
+bad_quiet:
+    return 0;
+}
+
+/* ── Exit codes ────────────────────────────────────────────────────────── */
+
+/* What a crash-style exit code means, or NULL. */
+static const wchar_t *exit_meaning(DWORD code) {
+    switch (code) {
+    case 0xC0000005: return L"access violation: the game crashed";
+    case 0xC00000FD: return L"stack overflow: the game crashed";
+    case 0xC0000374: return L"heap corruption: the game crashed";
+    case 0xC0000409: return L"fail-fast exit: the game stopped itself after an error";
+    case 0xC000001D: return L"illegal instruction: the CPU lacks something the game needs, or it crashed";
+    case 0xC0000094: return L"integer divide by zero: the game crashed";
+    case 0xC0000096: return L"privileged instruction: the game crashed";
+    case 0xC0000135: return L"a DLL the game needs is missing";
+    case 0xC0000139: return L"a DLL the game needs has the wrong version (entry point not found)";
+    case 0xC0000142: return L"a DLL failed to initialise";
+    case 0xC000007B: return L"bad image: a 32/64-bit mismatch or a damaged DLL";
+    case 0xC0000017: return L"out of memory";
+    case 0xC000013A: return L"stopped with Ctrl+C or closed";
+    case 0xC0000420: return L"assertion failure: the game stopped itself";
+    case 0x80000003: return L"breakpoint: the game hit a debug break";
+    case 0xE06D7363: return L"unhandled C++ exception: the game crashed";
+    case 0x40000015: return L"fatal application exit (abort)";
+    default:         return NULL;
+    }
+}
+
+/* "3", or "0xC0000005 (access violation: the game crashed)". */
+static const wchar_t *exit_text(DWORD code) {
+    static wchar_t buf[160];
+    const wchar_t *meaning = exit_meaning(code);
+    if (meaning)
+        _snwprintf(buf, ARRAYSIZE(buf), L"0x%08lX (%ls)", code, meaning);
+    else if (code >= 0x80000000UL)
+        _snwprintf(buf, ARRAYSIZE(buf), L"0x%08lX", code);
+    else
+        _snwprintf(buf, ARRAYSIZE(buf), L"%lu", code);
+    buf[ARRAYSIZE(buf) - 1] = L'\0';
+    return buf;
+}
+
+/* ── Log file, single instance, extra commands ─────────────────────────── */
+
+/* Open LogFile (overwritten each launch) and write what was logged so far.
+ * An empty path just drops the buffered lines. */
+static void open_log_file(const wchar_t *path) {
+    if (path[0]) {
+        g_log = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (g_log != INVALID_HANDLE_VALUE && g_early) write_utf8(g_log, g_early);
+    }
+    g_log_pending = 0;
+    free(g_early);
+    g_early = NULL;
+    g_early_len = g_early_cap = 0;
+    if (path[0] && g_log == INVALID_HANDLE_VALUE)
+        mlog(L"Warning: can't write the log file %ls (%ls)", path, err_text(GetLastError()));
+}
+
+/* SingleInstance: one loader per profile at a time. If another one is
+ * already running (its game still going), wait for it and return 1 so this
+ * one exits without starting a second copy. Waiting instead of exiting keeps
+ * wrappers that treat the loader's exit as the game's end (neutron cleans up
+ * the prefix 30 s after a direct launch exits) from acting while the first
+ * copy runs. The mutex is held until this loader exits. */
+static int wait_for_running_instance(const wchar_t *ini_full) {
+    unsigned long h1 = 2166136261UL, h2 = 5381;
+    wchar_t name[64];
+    for (const wchar_t *p = ini_full; *p; p++) {
+        unsigned long c = (unsigned long)towlower(*p);
+        h1 = ((h1 ^ c) * 16777619UL) & 0xFFFFFFFFUL;
+        h2 = ((h2 * 33) ^ c) & 0xFFFFFFFFUL;
+    }
+    _snwprintf(name, ARRAYSIZE(name), L"Local\\MythixLoader-%08lx%08lx", h1, h2);
+    name[ARRAYSIZE(name) - 1] = L'\0';
+    HANDLE m = CreateMutexW(NULL, TRUE, name);
+    if (!m) {
+        mlog(L"Warning: SingleInstance check failed (%ls); starting anyway", err_text(GetLastError()));
+        return 0;
+    }
+    if (GetLastError() != ERROR_ALREADY_EXISTS) return 0;   /* ours now, until we exit */
+    mlog(L"This profile's game is already running; not starting a second copy");
+    mlog(L"Waiting for the running one to exit...");
+    WaitForSingleObject(m, INFINITE);                       /* or abandoned: same */
+    ReleaseMutex(m);
+    CloseHandle(m);
+    mlog(L"The running copy has exited");
+    return 1;
+}
+
+/* RunBefore/RunAfter: run a command line and wait for it. */
+static void run_command(const wchar_t *what, const wchar_t *cmd, const wchar_t *dir) {
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    if (!cmd[0]) return;
+    wchar_t *line = _wcsdup(cmd);           /* CreateProcessW may write to it */
+    if (!line) return;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    mlog(L"%ls: %ls", what, cmd);
+    if (!CreateProcessW(NULL, line, NULL, NULL, FALSE, 0, NULL, dir[0] ? dir : NULL, &si, &pi)) {
+        mlog(L"Warning: %ls couldn't start (%ls)", what, err_text(GetLastError()));
+    } else {
+        DWORD code = 0;
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        GetExitCodeProcess(pi.hProcess, &code);
+        if (code) mlog(L"%ls exited with code %ls", what, exit_text(code));
+        else dbg(L"%ls finished", what);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    free(line);
 }
 
 /* ── Environment setup ─────────────────────────────────────────────────── */
@@ -325,11 +590,22 @@ static void set_env_vars(Config *cfg) {
     for (wchar_t *tok = vars, *end; tok; tok = end) {
         end = wcschr(tok, L';');
         if (end) *end++ = L'\0';
+        tok = trim(tok);
+        if (tok[0] == L'-') {                   /* -NAME removes a variable */
+            wchar_t *k = trim(tok + 1);
+            if (!k[0] || wcschr(k, L'=')) continue;
+            SetEnvironmentVariableW(k, NULL);
+            dbg(L"Removed env: %ls", k);
+            continue;
+        }
         wchar_t *eq = wcschr(tok, L'=');
         if (!eq) continue;
         *eq = L'\0';
-        wchar_t *k = trim(tok), *v = trim(eq + 1);
+        wchar_t *k = trim(tok);
+        wchar_t v[MAX_PATH_W * 4];
+        set_value(v, ARRAYSIZE(v), k, trim(eq + 1));
         if (!k[0]) continue;
+        expand_vars(v, ARRAYSIZE(v), k);        /* earlier entries count, too */
         SetEnvironmentVariableW(k, v);
         dbg(L"Set env: %ls=%ls", k, v);
     }
@@ -338,9 +614,12 @@ static void set_env_vars(Config *cfg) {
 
 /* ── Extra DLL loading ─────────────────────────────────────────────────── */
 
-/* These load into the loader process, not the game. */
+/* ExtraDlls load into the loader process only, never into the game, so they
+ * don't change how the game runs. They're kept for troubleshooting the
+ * loader itself (e.g. checking that a DLL loads in this prefix). */
 static void load_extra_dlls(Config *cfg) {
     if (!cfg->extra_dlls[0]) return;
+    mlog(L"Loading ExtraDlls into the loader process (not the game; troubleshooting only)");
     wchar_t *dlls = _wcsdup(cfg->extra_dlls);
     if (!dlls) return;
     for (wchar_t *tok = dlls, *end; tok; tok = end) {
@@ -412,6 +691,7 @@ typedef struct {
     int    pids_overflowed;         /* more than fit: the list is incomplete */
     DWORD  shown[256];              /* what the last "still waiting" list named */
     DWORD  blocking[256];           /* scratch for the current blocking set */
+    DWORD  priority;                /* Priority=, applied to every new process */
 } ProcessTree;
 
 /* Jobs only nest on Windows 8+ and Wine 6.9+. Without that, a game that puts
@@ -587,6 +867,15 @@ static int tree_wait(ProcessTree *t, const PROCESS_INFORMATION *pi) {
         case JOB_OBJECT_MSG_NEW_PROCESS:
             live++;
             tree_track(t, pid, 1);
+            /* Windows doesn't pass high/abovenormal priority on to child
+             * processes, so give the ones the game starts the same class. */
+            if (t->priority && pid != pi->dwProcessId) {
+                HANDLE h = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
+                if (h) {
+                    SetPriorityClass(h, t->priority);
+                    CloseHandle(h);
+                }
+            }
             /* Too early to name it: the new process isn't fully set up yet. */
             if (pid != pi->dwProcessId) dbg(L"Game started process %lu", pid);
             break;
@@ -607,8 +896,8 @@ static int tree_wait(ProcessTree *t, const PROCESS_INFORMATION *pi) {
                 if (n_shown > 0) {
                     /* Say what is keeping the loader around, in case it never ends. */
                     outlived = 1;
-                    mlog(L"Game exe exited (code %lu); still waiting for %d process(es) it started:",
-                         code, n_shown);
+                    mlog(L"Game exe exited with code %ls; still waiting for %d process(es) it started:",
+                         exit_text(code), n_shown);
                     log_blocking(shown, n_shown, t->pids_overflowed);
                 }
             }
@@ -660,7 +949,8 @@ static int tree_wait(ProcessTree *t, const PROCESS_INFORMATION *pi) {
     }
 }
 
-static DWORD launch_game(Config *cfg, int extra_argc, wchar_t **extra_argv) {
+static DWORD launch_game(Config *cfg, const wchar_t *run_dir, int extra_argc,
+                         wchar_t **extra_argv, int *launched) {
     /* Exe and ExeCommandLine are each capped at MAX_PATH_W, so this always fits. */
     static wchar_t cmd_line[MAX_CMD_LINE];
     if (cfg->exe_cmd_line[0]) {
@@ -678,11 +968,6 @@ static DWORD launch_game(Config *cfg, int extra_argc, wchar_t **extra_argv) {
     }
     if (extra_argc > 0) dbg(L"Forwarded %d extra argument(s) to the game", extra_argc);
 
-    /* Default to the exe's own folder, like starting it from Explorer. */
-    wchar_t run_dir[MAX_PATH_W];
-    wcscpy(run_dir, cfg->exe_run_dir[0] ? cfg->exe_run_dir : cfg->exe);
-    if (!cfg->exe_run_dir[0]) parent_dir(run_dir);
-
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si));
@@ -695,13 +980,20 @@ static DWORD launch_game(Config *cfg, int extra_argc, wchar_t **extra_argv) {
     ProcessTree tree;
     ZeroMemory(&tree, sizeof(tree));
     int track = cfg->persist && cfg->wait_children && tree_open(&tree);
+    DWORD prio = priority_class(cfg->priority);
+    DWORD_PTR affinity = affinity_mask(cfg->affinity);
+    tree.priority = prio;
+    /* Start it suspended when something has to be set up before it runs.
+     * Wine ignores CreateProcess's priority flag, so it's set again here. */
+    int suspended = track || affinity || prio;
 
+    *launched = 0;
     BOOL ok = CreateProcessW(
         NULL,
         cmd_line,
         NULL, NULL,
         FALSE,
-        track ? CREATE_SUSPENDED : 0,
+        (suspended ? CREATE_SUSPENDED : 0) | prio,
         NULL,
         run_dir[0] ? run_dir : NULL,
         &si,
@@ -719,13 +1011,29 @@ static DWORD launch_game(Config *cfg, int extra_argc, wchar_t **extra_argv) {
         return 1;
     }
 
-    if (track) {
-        /* It is still suspended: put it in the job before it can start anything. */
-        if (!AssignProcessToJobObject(tree.job, pi.hProcess)) {
+    if (suspended) {
+        if (prio) {
+            if (SetPriorityClass(pi.hProcess, prio)) dbg(L"Priority: %ls", cfg->priority);
+            else mlog(L"Warning: couldn't set Priority=%ls (%ls)", cfg->priority, err_text(GetLastError()));
+        }
+        /* Still suspended: put it in the job and pin its CPUs before it can
+         * run or start anything (its children inherit the affinity). */
+        if (track && !AssignProcessToJobObject(tree.job, pi.hProcess)) {
             mlog(L"Warning: can't follow the processes the game starts (%ls); waiting for the exe only",
                  err_text(GetLastError()));
             tree_close(&tree);
             track = 0;
+        }
+        if (affinity) {
+            DWORD_PTR proc_mask = 0, sys_mask = 0;
+            GetProcessAffinityMask(GetCurrentProcess(), &proc_mask, &sys_mask);
+            DWORD_PTR use = affinity & (sys_mask ? sys_mask : affinity);
+            if (!use)
+                mlog(L"Warning: Affinity=%ls names no CPU this machine has; ignored", cfg->affinity);
+            else if (!SetProcessAffinityMask(pi.hProcess, use))
+                mlog(L"Warning: couldn't set Affinity=%ls (%ls)", cfg->affinity, err_text(GetLastError()));
+            else
+                dbg(L"Affinity: mask 0x%lx", (unsigned long)use);
         }
         if (ResumeThread(pi.hThread) == (DWORD)-1) {
             mlog(L"Error: could not start the game (%ls)", err_text(GetLastError()));
@@ -738,6 +1046,7 @@ static DWORD launch_game(Config *cfg, int extra_argc, wchar_t **extra_argv) {
     }
 
     mlog(L"Game launched (PID %lu)", pi.dwProcessId);
+    *launched = 1;
 
     DWORD exit_code = 0;
     if (cfg->persist) {
@@ -746,9 +1055,9 @@ static DWORD launch_game(Config *cfg, int extra_argc, wchar_t **extra_argv) {
         WaitForSingleObject(pi.hProcess, INFINITE);     /* already done when tracking */
         GetExitCodeProcess(pi.hProcess, &exit_code);
         if (outlived)
-            mlog(L"All game processes have exited; returning the exe's exit code %lu", exit_code);
+            mlog(L"All game processes have exited; returning the exe's exit code, %ls", exit_text(exit_code));
         else
-            mlog(L"Game exited (code %lu)", exit_code);
+            mlog(L"Game exited with code %ls", exit_text(exit_code));
     }
     tree_close(&tree);
     CloseHandle(pi.hProcess);
@@ -759,7 +1068,7 @@ static DWORD launch_game(Config *cfg, int extra_argc, wchar_t **extra_argv) {
 /* ── Main ──────────────────────────────────────────────────────────────── */
 
 int wmain(int argc, wchar_t *argv[]) {
-    mlog(L"Mythix Loader v1.4");
+    mlog(L"Mythix Loader v1.5");
 
     /* Find our own directory for the ini */
     wchar_t self_dir[MAX_PATH_W];
@@ -810,17 +1119,60 @@ int wmain(int argc, wchar_t *argv[]) {
         return 1;
     }
     mlog(L"Config: %ls", ini_path);
-
     g_debug = g_debug || cfg.debug;
+
+    /* The ini's folder: relative paths and %MYTHIX_PROFILE_DIR% refer to it. */
+    wchar_t ini_full[MAX_PATH_W], ini_dir[MAX_PATH_W];
+    DWORD full = GetFullPathNameW(ini_path, MAX_PATH_W, ini_full, NULL);
+    if (full == 0 || full >= MAX_PATH_W) wcscpy(ini_full, ini_path);
+    wcscpy(ini_dir, ini_full);
+    parent_dir(ini_dir);
+    SetEnvironmentVariableW(L"MYTHIX_PROFILE_DIR", ini_dir);
+
+    if (cfg.single_instance) {
+        if (!cfg.persist) mlog(L"Note: SingleInstance only helps with Persist=1");
+        if (wait_for_running_instance(ini_full)) {
+            open_log_file(L"");                 /* leave the running copy's log alone */
+            free(extra);
+            return 0;
+        }
+    }
+
+    expand_vars(cfg.log_file, ARRAYSIZE(cfg.log_file), L"LogFile");
+    resolve_path(cfg.log_file, ARRAYSIZE(cfg.log_file), ini_dir, L"LogFile");
+    open_log_file(cfg.log_file);
+
+    expand_vars(cfg.exe, ARRAYSIZE(cfg.exe), L"Exe");
+    resolve_path(cfg.exe, ARRAYSIZE(cfg.exe), ini_dir, L"Exe");
+    wchar_t game_dir[MAX_PATH_W];
+    wcscpy(game_dir, cfg.exe);
+    parent_dir(game_dir);
+    SetEnvironmentVariableW(L"MYTHIX_GAME_DIR", game_dir);
+    expand_vars(cfg.exe_run_dir, ARRAYSIZE(cfg.exe_run_dir), L"ExeRunDir");
+    resolve_path(cfg.exe_run_dir, ARRAYSIZE(cfg.exe_run_dir), ini_dir, L"ExeRunDir");
 
     /* Set up environment */
     set_env_vars(&cfg);
+    expand_vars(cfg.exe_cmd_line, ARRAYSIZE(cfg.exe_cmd_line), L"ExeCommandLine");
+    expand_vars(cfg.run_before, ARRAYSIZE(cfg.run_before), L"RunBefore");
+    expand_vars(cfg.run_after, ARRAYSIZE(cfg.run_after), L"RunAfter");
+    expand_vars(cfg.extra_dlls, ARRAYSIZE(cfg.extra_dlls), L"ExtraDlls");
 
-    /* Load any extra DLLs */
+    /* Load any extra DLLs (into the loader only) */
     load_extra_dlls(&cfg);
 
+    /* Default to the exe's own folder, like starting it from Explorer. */
+    const wchar_t *run_dir = cfg.exe_run_dir[0] ? cfg.exe_run_dir : game_dir;
+    run_command(L"RunBefore", cfg.run_before, run_dir);
+
     /* Launch the game */
-    DWORD result = launch_game(&cfg, n_extra, extra);
+    int launched = 0;
+    DWORD result = launch_game(&cfg, run_dir, n_extra, extra, &launched);
+
+    if (cfg.run_after[0] && launched) {
+        if (cfg.persist) run_command(L"RunAfter", cfg.run_after, run_dir);
+        else mlog(L"Note: RunAfter needs Persist=1 (the loader doesn't wait for the game); skipped");
+    }
 
     free(extra);
     return (int)result;

@@ -1,6 +1,7 @@
 /* Stand-in for a game in the loader tests: prints its working directory,
- * arguments, Steam-related environment and whether it runs in a job object
- * (IN_JOB=0/1) as UTF-8, then exits with 7.
+ * arguments, Steam-related environment, whether it runs in a job object
+ * (IN_JOB=0/1), its priority class and CPU affinity mask as UTF-8, then exits
+ * with 7 (or with FAKE_EXIT, a hex code like C0000005).
  *
  * Launcher mode, for the Persist tests: with FAKE_SPAWN=1 it starts a copy
  * of itself as the "real game" and exits at once with 3, like a launcher exe.
@@ -54,6 +55,8 @@ static int start_child(const wchar_t *exe, DWORD flags, int own_job) {
 
 static void finish(void) {
     wchar_t buf[4096];
+    printf("PRIORITY_END=0x%lx\n", GetPriorityClass(GetCurrentProcess()));
+    fflush(stdout);
     if (GetEnvironmentVariableW(L"FAKE_MARKER", buf, 4096)) {
         HANDLE h = CreateFileW(buf, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
         if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
@@ -93,8 +96,9 @@ int wmain(int argc, wchar_t **argv) {
         snprintf(label, sizeof(label), "ARG%d", i);
         put(label, argv[i]);
     }
-    const wchar_t *vars[] = { L"SteamAppId", L"SteamGameId", L"MYTHIX_TEST" };
-    for (int i = 0; i < 3; i++) {
+    const wchar_t *vars[] = { L"SteamAppId", L"SteamGameId", L"MYTHIX_TEST",
+                              L"MYTHIX_PROFILE_DIR", L"MYTHIX_GAME_DIR" };
+    for (int i = 0; i < 5; i++) {
         char label[64];
         WideCharToMultiByte(CP_UTF8, 0, vars[i], -1, label, sizeof(label), NULL, NULL);
         if (GetEnvironmentVariableW(vars[i], buf, 4096)) put(label, buf);
@@ -103,6 +107,10 @@ int wmain(int argc, wchar_t **argv) {
     BOOL in_job = FALSE;
     IsProcessInJob(GetCurrentProcess(), NULL, &in_job);
     printf("IN_JOB=%d\n", in_job ? 1 : 0);
+    DWORD_PTR proc_mask = 0, sys_mask = 0;
+    GetProcessAffinityMask(GetCurrentProcess(), &proc_mask, &sys_mask);
+    printf("PRIORITY=0x%lx\nAFFINITY=0x%lx\n", GetPriorityClass(GetCurrentProcess()),
+           (unsigned long)proc_mask);
     fflush(stdout);
 
     if (GetEnvironmentVariableW(L"FAKE_CHAIN", buf, 4096)) return run_chain(buf);
@@ -118,5 +126,6 @@ int wmain(int argc, wchar_t **argv) {
 
     if (GetEnvironmentVariableW(L"FAKE_SLEEP_MS", buf, 4096)) Sleep((DWORD)_wtoi(buf));
     finish();
+    if (GetEnvironmentVariableW(L"FAKE_EXIT", buf, 4096)) ExitProcess((UINT)wcstoul(buf, NULL, 16));
     return 7;
 }

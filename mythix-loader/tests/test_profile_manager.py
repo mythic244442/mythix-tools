@@ -290,6 +290,44 @@ class CreateProfileTests(ProfileTestCase):
         self.create(inst)
         self.assertTrue(os.path.isfile(keep))
 
+    def test_new_profile_has_the_v15_keys(self):
+        inst = self.steam.install(480, "Spacewar", "Spacewar")
+        make_pe(os.path.join(inst, "Spacewar.exe"))
+        ini = self.read_ini(self.create(inst))
+        for k, v in {"SingleInstance": "1", "LogFile": "mythix_loader.log", "Priority": "",
+                     "Affinity": "", "RunBefore": "", "RunAfter": "", "ExtraDlls": "",
+                     "Persist": "1", "WaitForChildren": "1"}.items():
+            self.assertEqual(ini.get(k), v, k)
+
+    def test_refresh_keeps_user_settings(self):
+        inst = self.steam.install(480, "Spacewar", "Spacewar")
+        make_pe(os.path.join(inst, "Spacewar.exe"))
+        plan = self.create(inst)
+        with open(plan["ini_path"], encoding="utf-8") as f:
+            text = f.read()
+        edits = {"Priority=": "Priority=high", "EnvVars=": "EnvVars=DXVK_HUD=fps;-FOO",
+                 "RunBefore=": 'RunBefore="C:\\tools\\backup.exe" now', "Persist=1": "Persist=0",
+                 "LogFile=mythix_loader.log": "LogFile=", "AppId=480": "AppId=999"}
+        for a, b in edits.items():
+            self.assertIn(a, text)
+            text = text.replace(a, b, 1)
+        text += "SteamClientDll=C:\\old\\steamclient.dll\nMyOwnKey=keep me\n"
+        with open(plan["ini_path"], "w", encoding="utf-8") as f:
+            f.write(text)
+
+        plan = self.create(inst)
+        ini = self.read_ini(plan)
+        self.assertEqual(ini["Priority"], "high")
+        self.assertEqual(ini["EnvVars"], "DXVK_HUD=fps;-FOO")
+        self.assertEqual(ini["RunBefore"], '"C:\\tools\\backup.exe" now')
+        self.assertEqual(ini["Persist"], "0")
+        self.assertEqual(ini["LogFile"], "")                 # turned off on purpose: stays off
+        self.assertEqual(ini["AppId"], "480")                # from the game, not kept
+        self.assertEqual(ini["MyOwnKey"], "keep me")
+        self.assertNotIn("SteamClientDll", ini)              # retired keys are dropped
+        self.assertEqual(sorted(plan["kept_settings"]),
+                         ["EnvVars", "LogFile", "Persist", "Priority", "RunBefore"])
+
     def test_dry_run_writes_nothing(self):
         inst = self.steam.install(480, "Spacewar", "Spacewar")
         make_pe(os.path.join(inst, "Spacewar.exe"))
