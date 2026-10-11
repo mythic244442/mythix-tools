@@ -101,8 +101,10 @@ int wmain(int argc, wchar_t **argv) {
     for (int i = 0; i < 5; i++) {
         char label[64];
         WideCharToMultiByte(CP_UTF8, 0, vars[i], -1, label, sizeof(label), NULL, NULL);
+        SetLastError(0);                    /* an empty value leaves it alone */
         if (GetEnvironmentVariableW(vars[i], buf, 4096)) put(label, buf);
-        else printf("%s=<unset>\n", label);
+        else if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) printf("%s=<unset>\n", label);
+        else printf("%s=\n", label);                       /* set, but empty */
     }
     BOOL in_job = FALSE;
     IsProcessInJob(GetCurrentProcess(), NULL, &in_job);

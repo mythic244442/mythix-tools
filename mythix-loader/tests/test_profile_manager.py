@@ -328,6 +328,56 @@ class CreateProfileTests(ProfileTestCase):
         self.assertEqual(sorted(plan["kept_settings"]),
                          ["EnvVars", "LogFile", "Persist", "Priority", "RunBefore"])
 
+    def test_refresh_regenerates_exe_and_run_dir(self):
+        inst = self.steam.install(480, "Spacewar", "Spacewar")
+        make_pe(os.path.join(inst, "Spacewar.exe"))
+        plan = self.create(inst)
+        ini = self.read_ini(plan)
+        with open(plan["ini_path"], encoding="utf-8") as f:
+            text = f.read()
+        text = text.replace(f"Exe={ini['Exe']}", "Exe=C:\\old\\game.exe")
+        text = text.replace(f"ExeRunDir={ini['ExeRunDir']}", f"ExeRunDir={plan['profile_dir']}")
+        with open(plan["ini_path"], "w", encoding="utf-8") as f:
+            f.write(text)
+        again = self.read_ini(self.create(inst))
+        self.assertEqual(again["Exe"], ini["Exe"])
+        self.assertEqual(again["ExeRunDir"], ini["ExeRunDir"])   # e.g. a v1.2 profile-dir run dir
+
+    def test_refresh_reads_utf16_and_ansi_inis(self):
+        inst = self.steam.install(480, "Spacewar", "Spacewar")
+        make_pe(os.path.join(inst, "Spacewar.exe"))
+        plan = self.create(inst)
+        body = "[MythixLoader]\nExe=x\nEnvVars=NAME=Café\nPriority=high\n"
+        for raw in (b"\xff\xfe" + body.encode("utf-16-le"), body.encode("cp1252")):
+            with open(plan["ini_path"], "wb") as f:
+                f.write(raw)
+            ini = self.read_ini(self.create(inst))
+            self.assertEqual((ini["EnvVars"], ini["Priority"]), ("NAME=Café", "high"))
+
+    def test_hand_set_appid_survives_when_the_library_doesnt_know_the_game(self):
+        game = os.path.join(self.home, "Elsewhere", "Unknown Game")
+        make_pe(os.path.join(game, "game.exe"))
+        plan = self.create(game)
+        self.assertEqual(plan["appid"], "0")
+        with open(plan["ini_path"], encoding="utf-8") as f:
+            text = f.read().replace("AppId=0", "AppId=4242")
+        with open(plan["ini_path"], "w", encoding="utf-8") as f:
+            f.write(text)
+        self.assertEqual(self.read_ini(self.create(game))["AppId"], "4242")
+        self.assertEqual(self.create(game, dry_run=True)["appid"], "4242")
+
+    def test_dry_run_reports_what_it_would_keep(self):
+        inst = self.steam.install(480, "Spacewar", "Spacewar")
+        make_pe(os.path.join(inst, "Spacewar.exe"))
+        plan = self.create(inst)
+        with open(plan["ini_path"], encoding="utf-8") as f:
+            text = f.read().replace("ExeCommandLine=", "ExeCommandLine=-windowed")
+        with open(plan["ini_path"], "w", encoding="utf-8") as f:
+            f.write(text)
+        dry = self.create(inst, dry_run=True)
+        self.assertEqual(dry["kept_settings"], ["ExeCommandLine"])
+        self.assertEqual(dry["args"], "-windowed")
+
     def test_dry_run_writes_nothing(self):
         inst = self.steam.install(480, "Spacewar", "Spacewar")
         make_pe(os.path.join(inst, "Spacewar.exe"))

@@ -323,25 +323,44 @@ class LoaderUnderWine:
         _, _, out, _ = self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nEnvVars=FAKE_EXIT=C0000005\n")
         self.assertIn("Game exited with code 0xC0000005 (access violation: the game crashed)", out)
 
-    def test_vars_relative_paths_and_env_removal(self):
-        rel = os.path.join(self._testMethodName, "fg.exe")
-        os.makedirs(os.path.join(self.profile_dir(), self._testMethodName), exist_ok=True)
-        shutil.copy(self.fakegame, os.path.join(self.profile_dir(), rel))
-        ini = ("[MythixLoader]\n"
-               f"Exe={rel.replace(os.sep, '/')}\n"
-               "ExeCommandLine=%MYTHIX_PROFILE_DIR%\n"
-               "AppId=480\n"
-               "EnvVars=A=1;MYTHIX_TEST=%MYTHIX_GAME_DIR%|%A%|%SteamAppId%\n"
-               "Persist=1\n")
-        code, seen, out, _ = self.run_loader(ini)
+    def test_vars_and_paths_relative_to_the_ini(self):
+        # The ini sits in its own folder, away from the stub, and is given with --ini.
+        ini_dir = os.path.join(self.dir, "elsewhere")
+        os.makedirs(os.path.join(ini_dir, "rd"))
+        shutil.copy(self.fakegame, os.path.join(ini_dir, "fg.exe"))
+        ini = os.path.join(ini_dir, "my.ini")
+        with open(ini, "w", encoding="utf-8") as f:
+            f.write("[MythixLoader]\nExe=fg.exe\nExeRunDir=rd\nExeCommandLine=%MYTHIX_PROFILE_DIR%\n"
+                    "AppId=480\nEnvVars=A=1;MYTHIX_TEST=%MYTHIX_GAME_DIR%|%A%|%SteamAppId%\nPersist=1\n")
+        code, seen, out, _ = self.run_loader(None, "--ini", "Z:" + ini.replace("/", "\\"))
         self.assertEqual(code, 7, out)
-        self.assertTrue(seen.get("ARG1", "").endswith("\\profile"), out)
-        self.assertTrue(seen.get("MYTHIX_TEST", "").endswith(f"\\{self._testMethodName}|1|480"), out)
-        self.assertTrue(seen.get("CWD", "").endswith(f"\\{self._testMethodName}"), out)
-        _, seen, out, _ = self.run_loader(ini.replace("EnvVars=A=1;MYTHIX_TEST=%MYTHIX_GAME_DIR%|%A%|%SteamAppId%",
-                                                      "EnvVars=-MYTHIX_TEST"),
-                                          env={"MYTHIX_TEST": "from outside"})
+        win_dir = "Z:" + ini_dir.replace("/", "\\")
+        self.assertEqual(seen.get("ARG1"), win_dir, out)
+        self.assertEqual(seen.get("MYTHIX_TEST"), f"{win_dir}|1|480", out)  # Windows-form game dir
+        self.assertEqual(seen.get("CWD"), win_dir + "\\rd", out)
+
+    def test_env_removal_and_empty_values(self):
+        exe = self.game_at("plain", "game.exe")
+        base = f"[MythixLoader]\nExe={exe}\nPersist=1\n"
+        _, seen, out, _ = self.run_loader(base + "EnvVars=-MYTHIX_TEST\n", env={"MYTHIX_TEST": "outside"})
         self.assertEqual(seen.get("MYTHIX_TEST"), "<unset>", out)
+        _, seen, out, _ = self.run_loader(base + "EnvVars=MYTHIX_TEST=x;-MYTHIX_TEST\n")
+        self.assertEqual(seen.get("MYTHIX_TEST"), "<unset>", out)
+        _, seen, out, _ = self.run_loader(base + "EnvVars=MYTHIX_TEST=\n", env={"MYTHIX_TEST": "outside"})
+        self.assertEqual(seen.get("MYTHIX_TEST"), "", out)     # set to empty, not removed
+
+    def test_semicolons_stay_in_env_values(self):
+        exe = self.game_at("plain", "game.exe")
+        _, seen, out, _ = self.run_loader(
+            f"[MythixLoader]\nExe={exe}\nPersist=1\nEnvVars=B=x;MYTHIX_TEST=%B%;C:\\tools;D=1\n")
+        self.assertEqual(seen.get("MYTHIX_TEST"), "x;C:\\tools", out)
+
+    def test_log_file_can_use_the_game_dir(self):
+        exe = self.game_at("logged", "game.exe")
+        code, _, out, _ = self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\n"
+                                          "LogFile=%MYTHIX_GAME_DIR%\\%SteamAppId%-run.log\nAppId=480\n")
+        self.assertEqual(code, 7, out)
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, "logged", "480-run.log")), out)
 
     def test_priority_and_affinity_reach_the_game_and_its_children(self):
         marker = self.marker()
@@ -354,6 +373,18 @@ class LoaderUnderWine:
         self.assertEqual([l for l in lines if l.startswith("PRIORITY_END=")], ["PRIORITY_END=0x80"], out)
         self.assertEqual([l for l in lines if l.startswith("AFFINITY=")], ["AFFINITY=0x1"] * 2, out)
 
+    def test_affinity_syntax(self):
+        if (os.cpu_count() or 1) < 2:
+            self.skipTest("needs at least 2 CPUs")
+        exe = self.game_at("plain", "game.exe")
+        for value, mask in (("1", "0x2"), ("0-1", "0x3"), ("0, 1", "0x3"), ("0x2", "0x2")):
+            _, seen, out, _ = self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nAffinity={value}\n")
+            self.assertEqual(seen.get("AFFINITY"), mask, f"Affinity={value}\n{out}")
+        _, _, out, _ = self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nAffinity=0x1FFFFFFFFFFFFFFFF\n")
+        self.assertIn("is wider than this build's", out)
+        _, _, out, _ = self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nAffinity=-1\n")
+        self.assertIn("Warning: Affinity=-1", out)
+
     def test_bad_priority_and_affinity_only_warn(self):
         exe = self.game_at("plain", "game.exe")
         code, _, out, _ = self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nPriority=turbo\nAffinity=x\n")
@@ -363,22 +394,44 @@ class LoaderUnderWine:
 
     def test_run_before_and_after(self):
         exe = self.game_at("plain", "game.exe")
-        ini = (f"[MythixLoader]\nExe={exe}\nPersist=1\n"
+        ini = (f"[MythixLoader]\nExe={exe}\nPersist=1\nAppId=480\n"
                f'RunBefore="{self.fakegame}" before\nRunAfter="{self.fakegame}" after\n')
         code, _, out, _ = self.run_loader(ini)
         self.assertEqual(code, 7, out)
         order = [out.find(t) for t in ("ARG1=before", "Game launched", "Game exited", "ARG1=after")]
         self.assertTrue(-1 < order[0] < order[1] < order[2] < order[3], out)
         self.assertIn("RunBefore exited with code 7", out)
+        before = out[:order[0]].splitlines()
+        self.assertTrue(before[-1].endswith("\\plain"), out)   # CWD line: the game's working dir
+        self.assertIn("SteamAppId=480", out[order[0]:order[1]])  # the game's environment
         _, _, out, _ = self.run_loader(ini.replace("Persist=1", "Persist=0"))
         self.assertIn("RunAfter needs Persist=1", out)
         self.assertNotIn("ARG1=after", out)
+        _, _, out, _ = self.run_loader(ini.replace(f"Exe={exe}", f"Exe={self.dir}/missing.exe"))
+        self.assertIn("The game didn't start; running RunAfter anyway", out)
+        self.assertIn("ARG1=after", out)
+
+    def test_run_command_with_quoted_program_and_argument(self):
+        tool = os.path.join(self.dir, "tools dir", "tool.exe")
+        os.makedirs(os.path.dirname(tool))
+        shutil.copy(self.fakegame, tool)
+        exe = self.game_at("plain", "game.exe")
+        _, _, out, _ = self.run_loader(f'[MythixLoader]\nExe={exe}\nPersist=1\nRunBefore="{tool}" "arg one"\n')
+        self.assertIn("ARG1=arg one", out)
+        self.assertNotIn("couldn't start", out)
+
+    def test_run_command_can_start_a_linux_program(self):
+        exe = self.game_at("plain", "game.exe")
+        code, _, out, _ = self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nRunBefore=/bin/true\n")
+        self.assertEqual(code, 7, out)
+        self.assertIn("RunBefore started a Linux program", out)
 
     def test_single_instance_waits_for_the_running_copy(self):
         exe = self.game_at("plain", "game.exe")
         marker = self.marker()
         win_marker = "Z:" + marker.replace("/", "\\")
-        self.write_ini(f"[MythixLoader]\nExe={exe}\nPersist=1\nSingleInstance=1\n"
+        log_name = f"{self._testMethodName}.log"
+        self.write_ini(f"[MythixLoader]\nExe={exe}\nPersist=1\nSingleInstance=1\nLogFile={log_name}\n"
                        f"EnvVars=FAKE_SLEEP_MS=4000;FAKE_MARKER={win_marker}\n")
         first_log = os.path.join(self.dir, "first.log")
         with open(first_log, "wb") as f:
@@ -388,13 +441,18 @@ class LoaderUnderWine:
                 while "Game launched" not in self.read(first_log) and time.monotonic() < deadline:
                     time.sleep(0.1)
                 code, _, out, _ = self.run_loader(None)         # same ini, second launch
+                game_done_when_second_returned = os.path.exists(marker)
             finally:
                 first.wait(timeout=120)
         self.assertEqual(code, 0, out)
         self.assertIn("already running; not starting a second copy", out)
         self.assertNotIn("Launching:", out)
-        self.assertTrue(os.path.exists(marker), "the second launch returned before the first game ended")
+        self.assertTrue(game_done_when_second_returned, "the second launch didn't wait for the first game")
         self.assertEqual(self.read(first_log).count("Game launched"), 1)
+        with open(os.path.join(self.profile_dir(), log_name), encoding="utf-8") as f:
+            shared = f.read()
+        self.assertLess(shared.index("Game launched"), shared.index("already running"), shared)
+        self.assertLess(shared.index("already running"), shared.index("Game exited"), shared)
 
 
 class LoaderUnderWine64(LoaderUnderWine, unittest.TestCase):

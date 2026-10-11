@@ -17,7 +17,8 @@
  *       another copy), Priority and Affinity, RunBefore/RunAfter commands,
  *       %VARS% in values (plus MYTHIX_PROFILE_DIR / MYTHIX_GAME_DIR), paths
  *       relative to the ini's folder, and -NAME in EnvVars to remove a
- *       variable. Crash exit codes are named in the log.
+ *       variable. Crash exit codes are named in the log. Command-line keys
+ *       keep their quotes, and an EnvVars ';' only splits before NAME=.
  * v1.4: Persist waits for every process the game starts, not just the exe the
  *       ini names, so games that start through a small launcher exe are
  *       waited for properly. WaitForChildren=0 restores the exe-only wait.
@@ -50,6 +51,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <wctype.h>
 
 #define MAX_PATH_W   4096
 #define MAX_CMD_LINE 32768          /* CreateProcessW's limit, terminator included */
@@ -195,9 +197,10 @@ static wchar_t *trim(wchar_t *s) {
     return s;
 }
 
+/* "value" -> value, but only for one quoted value: "a" "b" stays as it is. */
 static void strip_quotes(wchar_t *s) {
     size_t len = wcslen(s);
-    if (len >= 2 && s[0] == L'"' && s[len - 1] == L'"') {
+    if (len >= 2 && s[0] == L'"' && s[len - 1] == L'"' && !wmemchr(s + 1, L'"', len - 2)) {
         memmove(s, s + 1, (len - 2) * sizeof(wchar_t));
         s[len - 2] = L'\0';
     }
@@ -315,7 +318,10 @@ static int read_ini(const wchar_t *path, Config *cfg) {
         *eq = L'\0';
         wchar_t *key = trim(line);
         wchar_t *val = trim(eq + 1);
-        strip_quotes(val);
+        /* Command lines keep their quotes: they go to CreateProcess as written. */
+        if (_wcsicmp(key, L"ExeCommandLine") && _wcsicmp(key, L"RunBefore") &&
+            _wcsicmp(key, L"RunAfter"))
+            strip_quotes(val);
 
 #define SET(field) set_value(cfg->field, ARRAYSIZE(cfg->field), key, val)
         if      (_wcsicmp(key, L"Exe") == 0)            SET(exe);
@@ -389,6 +395,28 @@ static void resolve_path(wchar_t *p, size_t cap, const wchar_t *base, const wcha
     wcscpy(p, joined);
 }
 
+/* A "/home/..." path in its Windows form ("Z:\home\..."), via Wine's own
+ * conversion; other paths are copied as they are. */
+static void dos_path(const wchar_t *path, wchar_t *out, size_t cap) {
+    typedef WCHAR *(CDECL *wine_get_dos_file_name_fn)(LPCSTR);
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    wine_get_dos_file_name_fn to_dos = k32
+        ? (wine_get_dos_file_name_fn)(void (*)(void))GetProcAddress(k32, "wine_get_dos_file_name")
+        : NULL;
+    set_value(out, cap, L"path", path);
+    if (path[0] != L'/' || !to_dos) return;
+    int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, NULL, 0, NULL, NULL);
+    char *unix_path = len > 0 ? malloc((size_t)len) : NULL;
+    if (!unix_path) return;
+    WideCharToMultiByte(CP_UTF8, 0, path, -1, unix_path, len, NULL, NULL);
+    WCHAR *dos = to_dos(unix_path);
+    free(unix_path);
+    if (dos) {
+        if (wcslen(dos) < cap) wcscpy(out, dos);
+        HeapFree(GetProcessHeap(), 0, dos);
+    }
+}
+
 /* ── Priority and affinity ─────────────────────────────────────────────── */
 
 /* idle, belownormal, normal, abovenormal, high (spaces, - and _ ignored). */
@@ -417,10 +445,21 @@ static DWORD_PTR affinity_mask(const wchar_t *v) {
     wchar_t *end;
     if (!v[0]) return 0;
     if (v[0] == L'0' && (v[1] == L'x' || v[1] == L'X')) {
-        mask = (DWORD_PTR)wcstoull(v + 2, &end, 16);
-        if (*trim(end) || !mask) goto bad;
-        return mask;
+        const wchar_t *digits = v + 2;
+        if (!iswxdigit(*digits)) goto bad;
+        unsigned long long m = 0;
+        for (; iswxdigit(*digits); digits++) {
+            unsigned d = (unsigned)(iswdigit(*digits) ? *digits - L'0' : (towlower(*digits) - L'a' + 10));
+            if (m >> (bits - 4)) {               /* another digit wouldn't fit */
+                mlog(L"Warning: Affinity=%ls is wider than this build's %u CPUs; ignored", v, bits);
+                goto bad_quiet;
+            }
+            m = (m << 4) | d;
+        }
+        if (*digits || !m) goto bad;
+        return (DWORD_PTR)m;
     }
+    if (!iswdigit(v[0])) goto bad;              /* no "-1" or "+3" */
     for (const wchar_t *p = v; *p; ) {
         while (*p == L' ' || *p == L',') p++;
         if (!*p) break;
@@ -491,12 +530,20 @@ static const wchar_t *exit_text(DWORD code) {
 
 /* ── Log file, single instance, extra commands ─────────────────────────── */
 
-/* Open LogFile (overwritten each launch) and write what was logged so far.
+/* Open LogFile and write what was logged so far: emptied first, unless
+ * append is set (a second launch waiting for the running one adds to that
+ * one's log). Writes always go to the end, so both can share the file.
  * An empty path just drops the buffered lines. */
-static void open_log_file(const wchar_t *path) {
+static void open_log_file(const wchar_t *path, int append) {
+    const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     if (path[0]) {
-        g_log = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
-                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (!append) {
+            HANDLE h = CreateFileW(path, GENERIC_WRITE, share, NULL, CREATE_ALWAYS,
+                                   FILE_ATTRIBUTE_NORMAL, NULL);
+            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        }
+        g_log = CreateFileW(path, FILE_APPEND_DATA | SYNCHRONIZE, share, NULL, OPEN_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
         if (g_log != INVALID_HANDLE_VALUE && g_early) write_utf8(g_log, g_early);
     }
     g_log_pending = 0;
@@ -513,7 +560,9 @@ static void open_log_file(const wchar_t *path) {
  * wrappers that treat the loader's exit as the game's end (neutron cleans up
  * the prefix 30 s after a direct launch exits) from acting while the first
  * copy runs. The mutex is held until this loader exits. */
-static int wait_for_running_instance(const wchar_t *ini_full) {
+static void open_log_file(const wchar_t *path, int append);
+
+static int wait_for_running_instance(const wchar_t *ini_full, const wchar_t *log_path) {
     unsigned long h1 = 2166136261UL, h2 = 5381;
     wchar_t name[64];
     for (const wchar_t *p = ini_full; *p; p++) {
@@ -529,6 +578,7 @@ static int wait_for_running_instance(const wchar_t *ini_full) {
         return 0;
     }
     if (GetLastError() != ERROR_ALREADY_EXISTS) return 0;   /* ours now, until we exit */
+    open_log_file(log_path, 1);                 /* add to the running copy's log */
     mlog(L"This profile's game is already running; not starting a second copy");
     mlog(L"Waiting for the running one to exit...");
     WaitForSingleObject(m, INFINITE);                       /* or abandoned: same */
@@ -550,6 +600,10 @@ static void run_command(const wchar_t *what, const wchar_t *cmd, const wchar_t *
     mlog(L"%ls: %ls", what, cmd);
     if (!CreateProcessW(NULL, line, NULL, NULL, FALSE, 0, NULL, dir[0] ? dir : NULL, &si, &pi)) {
         mlog(L"Warning: %ls couldn't start (%ls)", what, err_text(GetLastError()));
+    } else if (!pi.hProcess) {
+        /* Wine runs a Linux program or script as a Unix process and hands
+         * back no handle, so there's nothing to wait on. */
+        mlog(L"%ls started a Linux program; the loader can't wait for it or see its exit code", what);
     } else {
         DWORD code = 0;
         WaitForSingleObject(pi.hProcess, INFINITE);
@@ -557,7 +611,7 @@ static void run_command(const wchar_t *what, const wchar_t *cmd, const wchar_t *
         if (code) mlog(L"%ls exited with code %ls", what, exit_text(code));
         else dbg(L"%ls finished", what);
         CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+        if (pi.hThread) CloseHandle(pi.hThread);
     }
     free(line);
 }
@@ -569,6 +623,28 @@ static int all_digits(const wchar_t *s) {
     for (; *s; s++)
         if (*s < L'0' || *s > L'9') return 0;
     return 1;
+}
+
+/* EnvVars entries are separated by ';', but only a ';' followed by another
+ * NAME=... or -NAME starts a new one, so PATH=%PATH%;C:\tools keeps its ';'.
+ * Returns the separating ';' or NULL. */
+static int is_name_start(wchar_t c) {
+    return (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') || c == L'_';
+}
+
+static wchar_t *next_env_entry(wchar_t *s) {
+    for (wchar_t *p = wcschr(s, L';'); p; p = wcschr(p + 1, L';')) {
+        const wchar_t *q = p + 1;
+        while (*q == L' ' || *q == L'\t') q++;
+        if (!*q) return p;                      /* trailing ';' */
+        int removal = *q == L'-';
+        if (removal) q++;
+        if (!is_name_start(*q)) continue;
+        while (*q && *q != L'=' && *q != L';' && *q != L' ' && *q != L'\t') q++;
+        while (*q == L' ' || *q == L'\t') q++;
+        if (removal ? (*q == L';' || !*q) : *q == L'=') return p;
+    }
+    return NULL;
 }
 
 static void set_env_vars(Config *cfg) {
@@ -588,7 +664,7 @@ static void set_env_vars(Config *cfg) {
     wchar_t *vars = _wcsdup(cfg->env_vars);
     if (!vars) return;
     for (wchar_t *tok = vars, *end; tok; tok = end) {
-        end = wcschr(tok, L';');
+        end = next_env_entry(tok);
         if (end) *end++ = L'\0';
         tok = trim(tok);
         if (tok[0] == L'-') {                   /* -NAME removes a variable */
@@ -627,6 +703,7 @@ static void load_extra_dlls(Config *cfg) {
         if (end) *end++ = L'\0';
         wchar_t *path = trim(tok);
         if (!path[0]) continue;
+        mlog(L"  %ls", path);
         if (LoadLibraryW(path)) {
             dbg(L"Loaded extra DLL: %ls", path);
         } else {
@@ -1129,30 +1206,31 @@ int wmain(int argc, wchar_t *argv[]) {
     parent_dir(ini_dir);
     SetEnvironmentVariableW(L"MYTHIX_PROFILE_DIR", ini_dir);
 
+    /* Exe can use the inherited environment and %MYTHIX_PROFILE_DIR%. */
+    expand_vars(cfg.exe, ARRAYSIZE(cfg.exe), L"Exe");
+    resolve_path(cfg.exe, ARRAYSIZE(cfg.exe), ini_dir, L"Exe");
+    wchar_t game_dir[MAX_PATH_W], game_dir_dos[MAX_PATH_W];
+    wcscpy(game_dir, cfg.exe);
+    parent_dir(game_dir);
+    dos_path(game_dir, game_dir_dos, ARRAYSIZE(game_dir_dos));
+    SetEnvironmentVariableW(L"MYTHIX_GAME_DIR", game_dir_dos);
+
+    /* SteamAppId and EnvVars; everything after this can use them. */
+    set_env_vars(&cfg);
+    expand_vars(cfg.exe_run_dir, ARRAYSIZE(cfg.exe_run_dir), L"ExeRunDir");
+    resolve_path(cfg.exe_run_dir, ARRAYSIZE(cfg.exe_run_dir), ini_dir, L"ExeRunDir");
+    expand_vars(cfg.log_file, ARRAYSIZE(cfg.log_file), L"LogFile");
+    resolve_path(cfg.log_file, ARRAYSIZE(cfg.log_file), ini_dir, L"LogFile");
+
     if (cfg.single_instance) {
         if (!cfg.persist) mlog(L"Note: SingleInstance only helps with Persist=1");
-        if (wait_for_running_instance(ini_full)) {
-            open_log_file(L"");                 /* leave the running copy's log alone */
+        if (wait_for_running_instance(ini_full, cfg.log_file)) {
             free(extra);
             return 0;
         }
     }
+    open_log_file(cfg.log_file, 0);
 
-    expand_vars(cfg.log_file, ARRAYSIZE(cfg.log_file), L"LogFile");
-    resolve_path(cfg.log_file, ARRAYSIZE(cfg.log_file), ini_dir, L"LogFile");
-    open_log_file(cfg.log_file);
-
-    expand_vars(cfg.exe, ARRAYSIZE(cfg.exe), L"Exe");
-    resolve_path(cfg.exe, ARRAYSIZE(cfg.exe), ini_dir, L"Exe");
-    wchar_t game_dir[MAX_PATH_W];
-    wcscpy(game_dir, cfg.exe);
-    parent_dir(game_dir);
-    SetEnvironmentVariableW(L"MYTHIX_GAME_DIR", game_dir);
-    expand_vars(cfg.exe_run_dir, ARRAYSIZE(cfg.exe_run_dir), L"ExeRunDir");
-    resolve_path(cfg.exe_run_dir, ARRAYSIZE(cfg.exe_run_dir), ini_dir, L"ExeRunDir");
-
-    /* Set up environment */
-    set_env_vars(&cfg);
     expand_vars(cfg.exe_cmd_line, ARRAYSIZE(cfg.exe_cmd_line), L"ExeCommandLine");
     expand_vars(cfg.run_before, ARRAYSIZE(cfg.run_before), L"RunBefore");
     expand_vars(cfg.run_after, ARRAYSIZE(cfg.run_after), L"RunAfter");
@@ -1169,9 +1247,17 @@ int wmain(int argc, wchar_t *argv[]) {
     int launched = 0;
     DWORD result = launch_game(&cfg, run_dir, n_extra, extra, &launched);
 
-    if (cfg.run_after[0] && launched) {
-        if (cfg.persist) run_command(L"RunAfter", cfg.run_after, run_dir);
-        else mlog(L"Note: RunAfter needs Persist=1 (the loader doesn't wait for the game); skipped");
+    /* RunAfter: once the game has exited, or right away if it didn't start
+     * (so a RunBefore/RunAfter pair still cleans up). */
+    if (cfg.run_after[0]) {
+        if (!launched) {
+            mlog(L"The game didn't start; running RunAfter anyway");
+            run_command(L"RunAfter", cfg.run_after, run_dir);
+        } else if (cfg.persist) {
+            run_command(L"RunAfter", cfg.run_after, run_dir);
+        } else {
+            mlog(L"Note: RunAfter needs Persist=1 (the loader doesn't wait for the game); skipped");
+        }
     }
 
     free(extra);

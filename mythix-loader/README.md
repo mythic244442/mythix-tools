@@ -55,52 +55,88 @@ which is what registers the Steam client for the game.
 
 ```ini
 [MythixLoader]
-Exe=/path/to/Game.exe        ; required
-ExeRunDir=/path/to/workdir   ; game's working dir (default: the exe's folder)
-ExeCommandLine=              ; args always passed to the game
-AppId=480                    ; exported as SteamAppId/SteamGameId (0 = not set)
-EnvVars=KEY=VAL;-KEY2        ; extra environment for the game; -NAME removes one
-Persist=1                    ; wait for the game and return the exe's exit code
-WaitForChildren=1            ; ...and for every process it starts (0 = the exe only)
-SingleInstance=1             ; a second launch waits for the running game instead
-Priority=                    ; idle, belownormal, normal, abovenormal or high
-Affinity=                    ; CPU cores, e.g. 0 or 0,2-3 (or a mask like 0x5)
-RunBefore=                   ; command run (and waited for) before the game
-RunAfter=                    ; command run after the game exits (needs Persist=1)
-LogFile=mythix_loader.log    ; the loader's log, also written here; empty = none
-Debug=0                      ; more detail in the log
-ExtraDlls=                   ; DLLs loaded into the loader process only, NOT the game
+Exe=/path/to/Game.exe
+ExeRunDir=/path/to/workdir
+ExeCommandLine=
+AppId=480
+EnvVars=DXVK_HUD=fps;-SOME_VAR
+Persist=1
+WaitForChildren=1
+SingleInstance=1
+Priority=
+Affinity=
+RunBefore=
+RunAfter=
+LogFile=mythix_loader.log
+Debug=0
+ExtraDlls=
 ```
 
-Values can use `%VARS%`, expanded the Windows way (a name that isn't set
-stays as written). Besides the normal environment there are
-`%MYTHIX_PROFILE_DIR%` (the ini's folder), `%MYTHIX_GAME_DIR%` (the exe's
-folder) and `%SteamAppId%`; `EnvVars` entries can use the ones before them.
-Relative paths in `Exe`, `ExeRunDir` and `LogFile` are relative to the ini's
-folder, so a profile can move.
+Comments go on their own lines (`#` or `;` first). Anything after `=` is the
+value, so don't put a comment at the end of a line.
 
-- **LogFile** gets every loader line with a time stamp, overwritten each
-  launch. Useful under the Mythix launcher, which discards the loader's
+| Key | Default when missing | What it does |
+|---|---|---|
+| `Exe` | (required) | The game exe |
+| `ExeRunDir` | the exe's folder | The game's working directory |
+| `ExeCommandLine` | | Arguments always passed to the game |
+| `AppId` | | Exported as `SteamAppId`/`SteamGameId`/`SteamOverlayGameId` (0 = not set) |
+| `EnvVars` | | `KEY=VAL;KEY2=VAL2` for the game; `-NAME` removes a variable |
+| `Persist` | 0 | Wait for the game and return the exe's exit code |
+| `WaitForChildren` | 1 | ...and for every process it starts (0 = the exe only) |
+| `SingleInstance` | 0 | A second launch of this profile waits for the running game instead of starting another |
+| `Priority` | | `idle`, `belownormal`, `normal`, `abovenormal` or `high` |
+| `Affinity` | | CPU cores, e.g. `0` or `0,2-3`, or a mask like `0x5` |
+| `RunBefore` | | Command run, and waited for, before the game |
+| `RunAfter` | | Command run after the game exits (needs `Persist=1`) |
+| `LogFile` | (none) | The loader's log, also written to this file |
+| `Debug` | 0 | More detail in the log |
+| `ExtraDlls` | | DLLs loaded into the loader process only, **not** the game |
+
+New profiles get `Persist=1`, `SingleInstance=1` and
+`LogFile=mythix_loader.log`. To turn something off, set it to 0 or leave it
+empty: a key you delete comes back with its default when the profile is
+refreshed.
+
+Values can use `%VARS%`, expanded the Windows way (a name that isn't set stays
+as written, so a lone `%` in a path is fine). Besides the normal environment
+there are `%MYTHIX_PROFILE_DIR%` (the ini's folder), `%MYTHIX_GAME_DIR%` (the
+exe's folder), both in Windows form (`Z:\...`), and `%SteamAppId%`. `EnvVars`
+entries can use the ones before them, and every other key can use the
+`EnvVars` names, except `Exe`, which only gets the environment and
+`%MYTHIX_PROFILE_DIR%`. In `EnvVars`, a `;` only starts a new entry when a
+`NAME=` (or `-NAME`) follows, so `PATH=%PATH%;C:\tools` works. Relative paths in
+`Exe`, `ExeRunDir` and `LogFile` are relative to the ini's folder, so a profile
+can move.
+
+- **LogFile** gets every loader line with a time stamp, and is emptied at each
+  launch. It's useful under the Mythix launcher, which discards the loader's
   output unless `MYTHIX_CAPTURE_GAME_OUTPUT=1` is set. Exit codes that mean a
   crash are named, e.g. `0xC0000005 (access violation: the game crashed)`.
-- **SingleInstance** stops a second copy of the same profile while the game
-  is still running. The second launch waits for the running one and then
-  exits without starting anything. Waiting (instead of exiting at once) keeps
-  neutron from treating the second launch as finished and cleaning up the
-  prefix 30 s later. Needs `Persist=1`.
+- **SingleInstance** stops a second copy of the same profile while the game is
+  still running. The second launch adds a note to the log, waits for the
+  running one, and then exits without starting anything. Waiting (instead of
+  exiting at once) keeps neutron from treating the second launch as finished
+  and cleaning up the prefix 30 s later. Needs `Persist=1`.
 - **Priority** and **Affinity** apply to the game exe and, while the loader
   follows the game's processes, to everything it starts. One core
   (`Affinity=0`) is a classic fix for old games that glitch on many cores.
-  Under Wine the priority class is set, but how much it changes real
-  scheduling depends on your system.
+  Under Wine the priority class is set (the game sees it), but it usually
+  doesn't change real CPU scheduling.
 - **RunBefore** / **RunAfter** run a Windows command line in the game's
-  working directory, with the game's environment, and wait for it. To start
-  something without waiting, use `cmd /c start "" thing.exe`. `RunAfter` only
-  runs if the game launched and `Persist=1`.
+  working directory, with the game's environment, and wait for it. Give a full
+  path, or `%MYTHIX_GAME_DIR%\tool.exe`: a bare name is looked up next to the
+  loader and on `PATH`, not in the game folder. Quote paths with spaces:
+  `"C:\tools dir\backup.exe" "%MYTHIX_GAME_DIR%"`. Under Wine a Linux program
+  or script can be started too, but the loader can't wait for it or see its
+  exit code. `RunAfter` runs once the game has exited, or right away if it
+  couldn't start. Avoid commands that leave something running: through
+  neutron's `steam.exe` shim that keeps the session alive, and after a direct
+  launch neutron kills it with the prefix.
 - **ExtraDlls** loads DLLs into the loader process itself, never into the
-  game, so it doesn't change how the game runs. It's only there for
-  troubleshooting the loader (for example, checking a DLL loads in that
-  prefix), and the log says so when it's used.
+  game, so it doesn't change how the game runs. It's there for troubleshooting
+  the loader (for example, checking a DLL loads in that prefix), and the log
+  names each one. A DLL that crashes or hangs while loading stops the launch.
 
 With `Persist=1` the loader waits until the game exe and the processes it
 starts (and theirs) have exited, so a launcher exe that starts the real game
