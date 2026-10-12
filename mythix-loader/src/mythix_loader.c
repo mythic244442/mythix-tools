@@ -12,6 +12,11 @@
  * Mythix launcher (e.g. -dx11) reach it. Everything after "--" goes to the game
  * as-is, so a game can still be handed its own --debug.
  *
+ * v1.7: ShowConsole opens a debug console window the loader owns, so the
+ *       game's output and Wine's debug channels show up live under any compat
+ *       tool (not only Proton), and it stays open for a key press after the
+ *       game exits. Where there's no interactive console (headless, or output
+ *       redirected) it does nothing and the launch is unaffected.
  * v1.6: the profile folder is filled out. logs/ keeps the last few launch
  *       logs (LogHistory, the current one still at LogFile); last_run.ini
  *       records each run (time, duration, exit code) for the launcher to
@@ -63,7 +68,7 @@
 #define MAX_CMD_LINE 32768          /* CreateProcessW's limit, terminator included */
 #define MAX_INI_SIZE (1 << 20)
 #define INI_NAME     L"mythix_loader.ini"
-#define LOADER_VERSION L"1.6"
+#define LOADER_VERSION L"1.7"
 
 /* ── Logging ───────────────────────────────────────────────────────────── */
 
@@ -191,6 +196,7 @@ typedef struct {
     int     single_instance;
     int     log_history;
     int     last_run;
+    int     show_console;
     int     debug;
 } Config;
 
@@ -361,6 +367,7 @@ static int read_ini(const wchar_t *path, Config *cfg) {
         else if (_wcsicmp(key, L"SingleInstance") == 0) cfg->single_instance = parse_bool(key, val, 0);
         else if (_wcsicmp(key, L"LogHistory") == 0)     cfg->log_history = parse_int(key, val, 10, 100000);
         else if (_wcsicmp(key, L"LastRun") == 0)        cfg->last_run = parse_bool(key, val, 1);
+        else if (_wcsicmp(key, L"ShowConsole") == 0)    cfg->show_console = parse_bool(key, val, 0);
         else if (_wcsicmp(key, L"Persist") == 0)        cfg->persist = parse_bool(key, val, 0);
         else if (_wcsicmp(key, L"WaitForChildren") == 0) cfg->wait_children = parse_bool(key, val, 1);
         else if (_wcsicmp(key, L"Debug") == 0)          cfg->debug = parse_bool(key, val, 0);
@@ -1290,8 +1297,93 @@ static int tree_wait(ProcessTree *t, const PROCESS_INFORMATION *pi) {
     }
 }
 
+/* ── Debug console (ShowConsole) ────────────────────────────────────────── */
+
+/* A console window the loader owns, so the game's output and Wine's debug
+ * channels show up live whatever the compat tool is (not only under Proton),
+ * and the window waits for a key after the game exits so it can be read. It's
+ * only used when there's a real, interactive console to be had; where output
+ * is redirected or there's no display, console_open leaves everything as it
+ * was and the launch is unaffected. */
+typedef struct {
+    int    active;
+    HANDLE out;             /* CONOUT$ (inheritable: the game's stdout/stderr) */
+    HANDLE in;              /* CONIN$  (inheritable: the game's stdin) */
+} DebugConsole;
+
+static void console_close(DebugConsole *c) {
+    if (c->out && c->out != INVALID_HANDLE_VALUE) CloseHandle(c->out);
+    if (c->in && c->in != INVALID_HANDLE_VALUE) CloseHandle(c->in);
+    c->out = c->in = INVALID_HANDLE_VALUE;
+    c->active = 0;
+}
+
+static void console_open(DebugConsole *c, const wchar_t *title) {
+    SECURITY_ATTRIBUTES sa;
+    DWORD mode;
+    ZeroMemory(c, sizeof(*c));
+    c->out = c->in = INVALID_HANDLE_VALUE;
+    /* A new console window if the loader has none (the usual case under a
+     * compat tool), else whatever it already has. */
+    if (!AllocConsole() && GetLastError() != ERROR_ACCESS_DENIED) {
+        mlog(L"ShowConsole: couldn't open a console window (%ls); continuing without it",
+             err_text(GetLastError()));
+        return;
+    }
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = TRUE;               /* the game inherits these */
+    c->out = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+    c->in  = CreateFileW(L"CONIN$", GENERIC_READ | GENERIC_WRITE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+    /* Only take it over when it's a real interactive console — a window a
+     * person can see and press a key in. Otherwise leave the loader's handles
+     * alone so nothing that was being captured gets hidden. */
+    if (c->out == INVALID_HANDLE_VALUE || c->in == INVALID_HANDLE_VALUE ||
+        !GetConsoleMode(c->in, &mode)) {
+        dbg(L"ShowConsole: no interactive console here; continuing without it");
+        console_close(c);
+        return;
+    }
+    c->active = 1;
+    if (title) SetConsoleTitleW(title);
+    /* Point the loader's own output at the window too (put_err re-reads the
+     * std handle, so its lines follow). */
+    SetStdHandle(STD_OUTPUT_HANDLE, c->out);
+    SetStdHandle(STD_ERROR_HANDLE, c->out);
+    mlog(L"ShowConsole: debug console open; the game's output appears in this window");
+}
+
+static void console_apply(const DebugConsole *c, STARTUPINFOW *si) {
+    if (!c->active) return;
+    si->dwFlags |= STARTF_USESTDHANDLES;
+    si->hStdInput  = c->in;
+    si->hStdOutput = c->out;
+    si->hStdError  = c->out;
+}
+
+/* After the game exits, keep the window up until a key is pressed. */
+static void console_wait_key(const DebugConsole *c) {
+    INPUT_RECORD rec;
+    DWORD n;
+    if (!c->active) return;
+    write_utf8(c->out, L"\r\n[mythix-loader] The game has exited. "
+                       L"Press any key to close this window...\r\n");
+    FlushConsoleInputBuffer(c->in);
+    for (;;) {
+        if (!ReadConsoleInputW(c->in, &rec, 1, &n) || n == 0) return;
+        if (rec.EventType == KEY_EVENT && rec.Event.KeyEvent.bKeyDown &&
+            rec.Event.KeyEvent.wVirtualKeyCode != VK_SHIFT &&
+            rec.Event.KeyEvent.wVirtualKeyCode != VK_CONTROL &&
+            rec.Event.KeyEvent.wVirtualKeyCode != VK_MENU)
+            return;
+    }
+}
+
 static DWORD launch_game(Config *cfg, const wchar_t *run_dir, int extra_argc,
-                         wchar_t **extra_argv, int *launched, int *outlived_out) {
+                         wchar_t **extra_argv, int *launched, int *outlived_out,
+                         const DebugConsole *con) {
     if (outlived_out) *outlived_out = 0;
     /* Exe and ExeCommandLine are each capped at MAX_PATH_W, so this always fits. */
     static wchar_t cmd_line[MAX_CMD_LINE];
@@ -1316,6 +1408,11 @@ static DWORD launch_game(Config *cfg, const wchar_t *run_dir, int extra_argc,
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
 
+    /* With ShowConsole the game gets the debug console's handles so its output
+     * lands in that window; that needs the handles inherited. */
+    int inherit = con && con->active;
+    if (inherit) console_apply(con, &si);
+
     mlog(L"Launching: %ls", cmd_line);
     mlog(L"Working dir: %ls", run_dir[0] ? run_dir : L"(inherited)");
 
@@ -1334,7 +1431,7 @@ static DWORD launch_game(Config *cfg, const wchar_t *run_dir, int extra_argc,
         NULL,
         cmd_line,
         NULL, NULL,
-        FALSE,
+        inherit,
         (suspended ? CREATE_SUSPENDED : 0) | prio,
         NULL,
         run_dir[0] ? run_dir : NULL,
@@ -1514,13 +1611,28 @@ int wmain(int argc, wchar_t *argv[]) {
     int sn = _snwprintf(scripts_dir, ARRAYSIZE(scripts_dir), L"%ls\\scripts", ini_dir);
     if (sn <= 0 || (size_t)sn >= ARRAYSIZE(scripts_dir)) scripts_dir[0] = L'\0';
 
+    /* ShowConsole: open the debug window before the game starts, so the whole
+     * launch (and the game's output) shows in it. */
+    DebugConsole console;
+    ZeroMemory(&console, sizeof(console));
+    console.out = console.in = INVALID_HANDLE_VALUE;
+    if (cfg.show_console) {
+        const wchar_t *leaf = cfg.exe;
+        for (const wchar_t *p = cfg.exe; *p; p++)
+            if (*p == L'\\' || *p == L'/') leaf = p + 1;
+        wchar_t title[MAX_PATH_W];
+        _snwprintf(title, ARRAYSIZE(title), L"Mythix Loader \x2014 %ls", leaf);
+        title[ARRAYSIZE(title) - 1] = L'\0';
+        console_open(&console, title);
+    }
+
     /* Default to the exe's own folder, like starting it from Explorer. */
     const wchar_t *run_dir = cfg.exe_run_dir[0] ? cfg.exe_run_dir : game_dir;
     run_command(L"RunBefore", cfg.run_before, run_dir, scripts_dir);
 
     /* Launch the game */
     int launched = 0, outlived = 0;
-    DWORD result = launch_game(&cfg, run_dir, n_extra, extra, &launched, &outlived);
+    DWORD result = launch_game(&cfg, run_dir, n_extra, extra, &launched, &outlived, &console);
 
     /* RunAfter: once the game has exited, or right away if it didn't start
      * (so a RunBefore/RunAfter pair still cleans up). */
@@ -1536,6 +1648,9 @@ int wmain(int argc, wchar_t *argv[]) {
     }
 
     write_last_run(ini_dir, &cfg, &start_lt, start_tick, result, launched, outlived);
+
+    console_wait_key(&console);     /* ShowConsole: hold the window for a key */
+    console_close(&console);
 
     free(extra);
     return (int)result;

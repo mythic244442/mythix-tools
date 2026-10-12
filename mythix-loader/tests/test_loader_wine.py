@@ -319,7 +319,7 @@ class LoaderUnderWine:
         self.assertEqual(code, 7, out)
         with open(os.path.join(self.profile_dir(), log_name), encoding="utf-8") as f:
             logged = f.read()
-        self.assertRegex(logged, r"^\d\d:\d\d:\d\d\.\d{3} \[mythix-loader\] Mythix Loader v1\.6")
+        self.assertRegex(logged, r"^\d\d:\d\d:\d\d\.\d{3} \[mythix-loader\] Mythix Loader v1\.7")
         self.assertIn("Game exited with code 7", logged)
 
     def test_crash_codes_are_named(self):
@@ -461,7 +461,7 @@ class LoaderUnderWine:
         code, _, out, _ = self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nAppId=480\n")
         self.assertEqual(code, 7, out)
         lr = self.read_lastrun()
-        self.assertEqual(lr["LoaderVersion"], "1.6", lr)
+        self.assertEqual(lr["LoaderVersion"], "1.7", lr)
         self.assertEqual(lr["AppId"], "480", lr)
         self.assertEqual(lr["Launched"], "1", lr)
         self.assertEqual(lr["ExitKnown"], "1", lr)
@@ -484,6 +484,17 @@ class LoaderUnderWine:
         self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nLastRun=0\n")
         self.assertFalse(os.path.exists(lr_path))
 
+    def test_show_console_is_inert_without_an_interactive_console(self):
+        # Headless / output redirected: ShowConsole can't get an interactive
+        # console, so it does nothing — the game still launches and the loader
+        # doesn't block waiting for a key (a hang would time this test out).
+        exe = self.game_at("plain", "game.exe")
+        code, seen, out, _ = self.run_loader(
+            f"[MythixLoader]\nExe={exe}\nPersist=1\nAppId=480\nShowConsole=1\n")
+        self.assertEqual(code, 7, out)
+        self.assertEqual(seen.get("SteamAppId"), "480", out)
+        self.assertNotIn("debug console open", out)     # not activated here
+
     def test_previous_logs_are_rotated_into_a_logs_folder(self):
         exe = self.game_at("plain", "game.exe")
         log_name = f"{self._testMethodName}.log"
@@ -498,7 +509,7 @@ class LoaderUnderWine:
         self.assertEqual(len(archived), 2, archived)        # 3 runs: 2 rotated, 1 live
         self.assertTrue(os.path.isfile(os.path.join(self.profile_dir(), log_name)))
         with open(os.path.join(logs_dir, sorted(archived)[0]), encoding="utf-8") as f:
-            self.assertIn("Mythix Loader v1.6", f.read())   # a real previous run
+            self.assertIn("Mythix Loader v1.7", f.read())   # a real previous run
 
     def test_log_history_caps_how_many_are_kept(self):
         exe = self.game_at("plain", "game.exe")

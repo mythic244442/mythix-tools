@@ -87,6 +87,7 @@ RunAfter=
 LogFile=mythix_loader.log
 LogHistory=10
 LastRun=1
+ShowConsole=0
 Debug=0
 ExtraDlls=
 ```
@@ -109,8 +110,9 @@ value, so don't put a comment at the end of a line.
 | `RunBefore` | | Command run, and waited for, before the game |
 | `RunAfter` | | Command run after the game exits (needs `Persist=1`) |
 | `LogFile` | (none) | The loader's log, also written to this file |
-| `LogHistory` | 10 | How many previous logs to keep in a `logs/` folder (0 = none) |
+| `LogHistory` | 10 | How many previous logs to keep in a `logs/` folder (0 = stop archiving) |
 | `LastRun` | 1 | Write `last_run.ini` (time, duration, exit code) after each launch |
+| `ShowConsole` | 0 | Open a console window with the game's output; waits for a key at the end |
 | `Debug` | 0 | More detail in the log |
 | `ExtraDlls` | | DLLs loaded into the loader process only, **not** the game |
 
@@ -136,13 +138,23 @@ can move.
   crash are named, e.g. `0xC0000005 (access violation: the game crashed)`.
 - **LogHistory** keeps the last few launches around: before a run empties
   `LogFile`, the previous one is moved into a `logs/` folder beside it, named
-  with its own time stamp, and only the newest `LogHistory` are kept (0 keeps
-  none, so only the current `LogFile` remains). The live log stays at
-  `LogFile`; `logs/` holds the runs before it.
+  with its own time stamp, and only the newest `LogHistory` are kept. The live
+  log stays at `LogFile`; `logs/` holds the runs before it. `0` stops archiving
+  (any logs already in `logs/` are left alone). Pruning goes by each file's
+  own time, so a rapid relaunch never drops the newest.
 - **LastRun** writes `last_run.ini` in the profile folder after each launch — a
   small machine-readable record (start and finish time, duration, and, when the
   loader waited, the exit code and what it means) for the Mythix launcher to
   read. It's overwritten each run and safe to delete; set `LastRun=0` to skip it.
+- **ShowConsole** opens a console window the loader owns and hands the game its
+  output, so the game's own stdout/stderr and Wine's debug channels show up live
+  — under any compat tool, not only Proton. The loader's own lines appear there
+  too, and after the game exits the window waits for a key so you can read it.
+  To see Wine's debug channels, set them yourself, e.g.
+  `EnvVars=WINEDEBUG=+warn,+seh`. It needs a real desktop console: where output
+  is redirected or there's no display (a headless run), it does nothing and the
+  launch is unchanged. Under neutron the window keeps the Steam session marked
+  "running" until you close it (that's the point — it stays up for you to read).
 - **SingleInstance** stops a second copy of the same profile while the game is
   still running. The second launch adds a note to the log, waits for the
   running one, and then exits without starting anything. Waiting (instead of

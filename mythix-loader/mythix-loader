@@ -1078,7 +1078,7 @@ def create_profile(game_dir, appid=None, target_exe=None, profile_name=None, dry
                 ("WaitForChildren", "1"), ("SingleInstance", "1"), ("Priority", ""),
                 ("Affinity", ""), ("RunBefore", ""), ("RunAfter", ""),
                 ("LogFile", "mythix_loader.log"), ("LogHistory", "10"), ("LastRun", "1"),
-                ("Debug", "0"), ("ExtraDlls", "")]
+                ("ShowConsole", "0"), ("Debug", "0"), ("ExtraDlls", "")]
     settings = {name: old[name.lower()][1] if name.lower() in old else default
                 for name, default in defaults}
     kept = [name for name, default in defaults if settings[name] != default]
@@ -1218,10 +1218,15 @@ def create_profile(game_dir, appid=None, target_exe=None, profile_name=None, dry
         "",
         "# The loader's log, also written here (overwritten each launch); empty = none.",
         key("LogFile", "mythix_loader.log"),
-        "# How many previous logs to keep in the logs\\ folder (0 = don't keep any).",
+        "# How many previous logs to keep in the logs\\ folder (0 stops archiving;",
+        "# any logs already in logs\\ are left alone).",
         key("LogHistory", "10"),
         "# Write last_run.ini (time, duration, exit code) after each launch.",
         key("LastRun", "1"),
+        "# Open a console window showing the game's output and Wine's debug channels",
+        "# (handy, works under any compat tool); it waits for a key after the game",
+        "# exits. Needs a real desktop console; ignored where there isn't one.",
+        key("ShowConsole", "0"),
         "# More detail in the log",
         key("Debug", "0"),
         "",
@@ -1232,7 +1237,8 @@ def create_profile(game_dir, appid=None, target_exe=None, profile_name=None, dry
     ]
     known = {"exe", "exerundir", "appid", "execommandline", "envvars", "persist",
              "waitforchildren", "singleinstance", "priority", "affinity", "runbefore",
-             "runafter", "logfile", "loghistory", "lastrun", "debug", "extradlls"} | RETIRED_INI_KEYS
+             "runafter", "logfile", "loghistory", "lastrun", "showconsole",
+             "debug", "extradlls"} | RETIRED_INI_KEYS
     extra = [f"{name}={value}" for low, (name, value) in old.items() if low not in known]
     if extra:
         ini_lines += ["", "# Kept from the previous ini (this loader version doesn't use them)"] + extra

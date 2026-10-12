@@ -318,6 +318,7 @@ class CreateProfileTests(ProfileTestCase):
         ini = self.read_ini(plan)
         self.assertEqual(ini.get("LogHistory"), "10")
         self.assertEqual(ini.get("LastRun"), "1")
+        self.assertEqual(ini.get("ShowConsole"), "0")
 
     def test_example_script_is_kept_but_readme_regenerated_on_refresh(self):
         inst = self.steam.install(480, "Spacewar", "Spacewar")
@@ -338,12 +339,14 @@ class CreateProfileTests(ProfileTestCase):
         make_pe(os.path.join(inst, "Spacewar.exe"))
         plan = self.create(inst)
         with open(plan["ini_path"], encoding="utf-8") as f:
-            text = f.read().replace("LogHistory=10", "LogHistory=3").replace("LastRun=1", "LastRun=0")
+            text = (f.read().replace("LogHistory=10", "LogHistory=3")
+                    .replace("LastRun=1", "LastRun=0").replace("ShowConsole=0", "ShowConsole=1"))
         with open(plan["ini_path"], "w", encoding="utf-8") as f:
             f.write(text)
         ini = self.read_ini(self.create(inst))
         self.assertEqual(ini["LogHistory"], "3")
         self.assertEqual(ini["LastRun"], "0")
+        self.assertEqual(ini["ShowConsole"], "1")
 
     def test_refresh_keeps_user_settings(self):
         inst = self.steam.install(480, "Spacewar", "Spacewar")
