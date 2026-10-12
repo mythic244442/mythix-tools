@@ -308,6 +308,10 @@ class LoaderUnderWine:
     def profile_dir(self):
         return os.path.dirname(self.stub)
 
+    def read_lastrun(self):
+        with open(os.path.join(self.profile_dir(), "last_run.ini"), encoding="utf-8") as f:
+            return self.parse(f.read())
+
     def test_log_file_is_written_next_to_the_ini(self):
         exe = self.game_at("plain", "game.exe")
         log_name = f"{self._testMethodName}.log"
@@ -315,7 +319,7 @@ class LoaderUnderWine:
         self.assertEqual(code, 7, out)
         with open(os.path.join(self.profile_dir(), log_name), encoding="utf-8") as f:
             logged = f.read()
-        self.assertRegex(logged, r"^\d\d:\d\d:\d\d\.\d{3} \[mythix-loader\] Mythix Loader v1\.5")
+        self.assertRegex(logged, r"^\d\d:\d\d:\d\d\.\d{3} \[mythix-loader\] Mythix Loader v1\.6")
         self.assertIn("Game exited with code 7", logged)
 
     def test_crash_codes_are_named(self):
@@ -425,6 +429,107 @@ class LoaderUnderWine:
         code, _, out, _ = self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nRunBefore=/bin/true\n")
         self.assertEqual(code, 7, out)
         self.assertIn("RunBefore started a Linux program", out)
+
+    def test_runbefore_finds_an_exe_in_the_scripts_folder(self):
+        exe = self.game_at("plain", "game.exe")
+        scripts = os.path.join(self.profile_dir(), "scripts")
+        os.makedirs(scripts, exist_ok=True)
+        hook = f"{self._testMethodName}.exe"
+        shutil.copy(self.fakegame, os.path.join(scripts, hook))
+        # A bare name is taken from scripts/ even though it isn't on PATH.
+        _, _, out, _ = self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nRunBefore={hook} here\n")
+        self.assertIn("ARG1=here", out)
+        self.assertNotIn("couldn't start", out)
+        self.assertIn("RunBefore exited with code 7", out)
+
+    def test_runbefore_runs_a_bat_from_the_scripts_folder(self):
+        exe = self.game_at("plain", "game.exe")
+        scripts = os.path.join(self.profile_dir(), "scripts")
+        os.makedirs(scripts, exist_ok=True)
+        marker = self.marker()
+        win_marker = "Z:" + marker.replace("/", "\\")
+        bat = os.path.join(scripts, f"{self._testMethodName}.bat")
+        with open(bat, "w", newline="\r\n") as f:
+            f.write(f'@echo off\r\necho hello from the script\r\necho ok> "{win_marker}"\r\n')
+        code, _, out, _ = self.run_loader(
+            f"[MythixLoader]\nExe={exe}\nPersist=1\nRunBefore={os.path.basename(bat)}\n")
+        self.assertEqual(code, 7, out)
+        self.assertTrue(self.wait_for(marker), out)     # the .bat ran (through cmd.exe)
+
+    def test_last_run_records_the_run(self):
+        exe = self.game_at("plain", "game.exe")
+        code, _, out, _ = self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nAppId=480\n")
+        self.assertEqual(code, 7, out)
+        lr = self.read_lastrun()
+        self.assertEqual(lr["LoaderVersion"], "1.6", lr)
+        self.assertEqual(lr["AppId"], "480", lr)
+        self.assertEqual(lr["Launched"], "1", lr)
+        self.assertEqual(lr["ExitKnown"], "1", lr)
+        self.assertEqual(lr["ExitCode"], "7", lr)
+        self.assertRegex(lr["Started"], r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
+        self.assertIn("DurationSeconds", lr)
+
+    def test_last_run_names_a_crash_code(self):
+        exe = self.game_at("plain", "game.exe")
+        self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nEnvVars=FAKE_EXIT=C0000005\n")
+        lr = self.read_lastrun()
+        self.assertEqual(lr["ExitCodeHex"], "0xC0000005", lr)
+        self.assertIn("access violation", lr["ExitMeaning"], lr)
+
+    def test_last_run_can_be_turned_off(self):
+        exe = self.game_at("plain", "game.exe")
+        lr_path = os.path.join(self.profile_dir(), "last_run.ini")
+        if os.path.exists(lr_path):
+            os.remove(lr_path)
+        self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nLastRun=0\n")
+        self.assertFalse(os.path.exists(lr_path))
+
+    def test_previous_logs_are_rotated_into_a_logs_folder(self):
+        exe = self.game_at("plain", "game.exe")
+        log_name = f"{self._testMethodName}.log"
+        logs_dir = os.path.join(self.profile_dir(), "logs")
+        for _ in range(3):
+            code, _, out, _ = self.run_loader(
+                f"[MythixLoader]\nExe={exe}\nPersist=1\nLogFile={log_name}\n")
+            self.assertEqual(code, 7, out)
+        base = self._testMethodName
+        archived = [f for f in os.listdir(logs_dir)
+                    if f.startswith(base + "_") and f.endswith(".log")]
+        self.assertEqual(len(archived), 2, archived)        # 3 runs: 2 rotated, 1 live
+        self.assertTrue(os.path.isfile(os.path.join(self.profile_dir(), log_name)))
+        with open(os.path.join(logs_dir, sorted(archived)[0]), encoding="utf-8") as f:
+            self.assertIn("Mythix Loader v1.6", f.read())   # a real previous run
+
+    def test_log_history_caps_how_many_are_kept(self):
+        exe = self.game_at("plain", "game.exe")
+        log_name = f"{self._testMethodName}.log"
+        logs_dir = os.path.join(self.profile_dir(), "logs")
+        for _ in range(4):
+            self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nLogFile={log_name}\nLogHistory=2\n")
+        base = self._testMethodName
+        archived = [f for f in os.listdir(logs_dir) if f.startswith(base + "_")]
+        self.assertEqual(len(archived), 2, archived)        # capped at LogHistory=2
+
+    def test_log_rotation_keeps_the_newest_run(self):
+        # With LogHistory=1, the one surviving archive must be the most recent
+        # rotated run — even when launches land in the same clock second (the
+        # name stamp is only to the second, so pruning must go by file time).
+        exe = self.game_at("plain", "game.exe")
+        log_name = f"{self._testMethodName}.log"
+        live = os.path.join(self.profile_dir(), log_name)
+        logs_dir = os.path.join(self.profile_dir(), "logs")
+        stamps = []
+        for _ in range(4):
+            self.run_loader(f"[MythixLoader]\nExe={exe}\nPersist=1\nLogFile={log_name}\nLogHistory=1\n")
+            with open(live, encoding="utf-8") as f:
+                stamps.append(f.readline().split()[0])      # this run's banner time stamp
+        base = self._testMethodName
+        archived = [f for f in os.listdir(logs_dir) if f.startswith(base + "_") and f.endswith(".log")]
+        self.assertEqual(len(archived), 1, archived)
+        with open(os.path.join(logs_dir, archived[0]), encoding="utf-8") as f:
+            survivor = f.readline().split()[0]
+        # 4 runs, history 1: run4 is the live log, so the newest archived is run3.
+        self.assertEqual(survivor, stamps[2], f"kept {survivor}; runs were {stamps}")
 
     def test_single_instance_waits_for_the_running_copy(self):
         exe = self.game_at("plain", "game.exe")

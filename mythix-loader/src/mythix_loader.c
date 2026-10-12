@@ -12,6 +12,12 @@
  * Mythix launcher (e.g. -dx11) reach it. Everything after "--" goes to the game
  * as-is, so a game can still be handed its own --debug.
  *
+ * v1.6: the profile folder is filled out. logs/ keeps the last few launch
+ *       logs (LogHistory, the current one still at LogFile); last_run.ini
+ *       records each run (time, duration, exit code) for the launcher to
+ *       read; a bare RunBefore/RunAfter name is found in the profile's
+ *       scripts/ folder, and .bat/.cmd scripts run through the command
+ *       processor.
  * v1.5: more ini keys: LogFile (the log also goes to a file), SingleInstance
  *       (a second launch waits for the running game instead of starting
  *       another copy), Priority and Affinity, RunBefore/RunAfter commands,
@@ -57,6 +63,7 @@
 #define MAX_CMD_LINE 32768          /* CreateProcessW's limit, terminator included */
 #define MAX_INI_SIZE (1 << 20)
 #define INI_NAME     L"mythix_loader.ini"
+#define LOADER_VERSION L"1.6"
 
 /* ── Logging ───────────────────────────────────────────────────────────── */
 
@@ -182,6 +189,8 @@ typedef struct {
     int     persist;
     int     wait_children;
     int     single_instance;
+    int     log_history;
+    int     last_run;
     int     debug;
 } Config;
 
@@ -217,6 +226,18 @@ static int parse_bool(const wchar_t *key, const wchar_t *v, int dflt) {
     }
     if (v[0]) mlog(L"Warning: %ls=%ls isn't 1/0 (true/false, yes/no, on/off); using %d", key, v, dflt);
     return dflt;
+}
+
+/* A non-negative integer, else the default (with a warning). Clamped to max. */
+static int parse_int(const wchar_t *key, const wchar_t *v, int dflt, int max) {
+    wchar_t *end;
+    if (!v[0]) return dflt;
+    long n = wcstol(v, &end, 10);
+    if (*end || n < 0) {
+        mlog(L"Warning: %ls=%ls isn't a number 0 or more; using %d", key, v, dflt);
+        return dflt;
+    }
+    return n > max ? max : (int)n;
 }
 
 /* Copy a value into a fixed buffer, warning instead of silently cutting it. */
@@ -292,6 +313,8 @@ static int read_ini(const wchar_t *path, Config *cfg) {
 
     memset(cfg, 0, sizeof(*cfg));
     cfg->wait_children = 1;
+    cfg->log_history = 10;
+    cfg->last_run = 1;
     int in_section = 0;
     wchar_t *next = text;
     while (next) {
@@ -336,6 +359,8 @@ static int read_ini(const wchar_t *path, Config *cfg) {
         else if (_wcsicmp(key, L"Priority") == 0)       SET(priority);
         else if (_wcsicmp(key, L"Affinity") == 0)       SET(affinity);
         else if (_wcsicmp(key, L"SingleInstance") == 0) cfg->single_instance = parse_bool(key, val, 0);
+        else if (_wcsicmp(key, L"LogHistory") == 0)     cfg->log_history = parse_int(key, val, 10, 100000);
+        else if (_wcsicmp(key, L"LastRun") == 0)        cfg->last_run = parse_bool(key, val, 1);
         else if (_wcsicmp(key, L"Persist") == 0)        cfg->persist = parse_bool(key, val, 0);
         else if (_wcsicmp(key, L"WaitForChildren") == 0) cfg->wait_children = parse_bool(key, val, 1);
         else if (_wcsicmp(key, L"Debug") == 0)          cfg->debug = parse_bool(key, val, 0);
@@ -554,6 +579,178 @@ static void open_log_file(const wchar_t *path, int append) {
         mlog(L"Warning: can't write the log file %ls (%ls)", path, err_text(GetLastError()));
 }
 
+/* ── Log history (logs/) and last_run.ini ──────────────────────────────── */
+
+/* A file's last-write time, local, as YYYYMMDD_HHMMSS (sorts chronologically). */
+static int file_time_stamp(const wchar_t *path, wchar_t *out, size_t cap) {
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    FILETIME local;
+    SYSTEMTIME st;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) return 0;
+    if (!FileTimeToLocalFileTime(&fad.ftLastWriteTime, &local)) return 0;
+    if (!FileTimeToSystemTime(&local, &st)) return 0;
+    _snwprintf(out, cap, L"%04u%02u%02u_%02u%02u%02u",
+               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    out[cap - 1] = L'\0';
+    return 1;
+}
+
+typedef struct { wchar_t *name; FILETIME time; } LogFileEntry;
+
+static int logfile_cmp_desc(const void *a, const void *b) {
+    const LogFileEntry *x = a, *y = b;
+    return CompareFileTime(&y->time, &x->time);     /* newest first */
+}
+
+/* Keep only the newest `history` of logs/<base>_*<ext>. Ordering is by each
+ * file's real last-write time, not its name: the name's time stamp is only to
+ * the second, so same-second rotations share a stamp (and get a _N counter),
+ * and a local-time stamp can even go backwards across a DST change — the file
+ * time stays correct in both cases. */
+static void prune_logs(const wchar_t *logs_dir, const wchar_t *base,
+                       const wchar_t *ext, int history) {
+    wchar_t pat[MAX_PATH_W];
+    WIN32_FIND_DATAW fd;
+    LogFileEntry *files = NULL;
+    int count = 0, cap = 0;
+    _snwprintf(pat, ARRAYSIZE(pat), L"%ls\\%ls_*%ls", logs_dir, base, ext);
+    pat[ARRAYSIZE(pat) - 1] = L'\0';
+    HANDLE hf = FindFirstFileW(pat, &fd);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (count == cap) {
+            int ncap = cap ? cap * 2 : 32;
+            LogFileEntry *grown = realloc(files, (size_t)ncap * sizeof(*grown));
+            if (!grown) break;
+            files = grown;
+            cap = ncap;
+        }
+        files[count].name = _wcsdup(fd.cFileName);
+        if (!files[count].name) break;
+        files[count].time = fd.ftLastWriteTime;
+        count++;
+    } while (FindNextFileW(hf, &fd));
+    FindClose(hf);
+    if (count > history) {
+        qsort(files, (size_t)count, sizeof(*files), logfile_cmp_desc);
+        for (int i = history; i < count; i++) {
+            wchar_t full[MAX_PATH_W];
+            int n = _snwprintf(full, ARRAYSIZE(full), L"%ls\\%ls", logs_dir, files[i].name);
+            if (n > 0 && (size_t)n < ARRAYSIZE(full)) DeleteFileW(full);
+        }
+    }
+    for (int i = 0; i < count; i++) free(files[i].name);
+    free(files);
+}
+
+/* Before the log is opened fresh, move the previous one into a logs/ folder
+ * next to it, named with its own time stamp, and prune to `history` files.
+ * The live log stays at LogFile; logs/ holds the runs before this one. */
+static void rotate_logs(const wchar_t *log_path, int history) {
+    wchar_t dir[MAX_PATH_W], name[MAX_PATH_W], base[MAX_PATH_W], ext[64];
+    wchar_t logs_dir[MAX_PATH_W], stamp[32], dest[MAX_PATH_W];
+    wchar_t *sep, *dot;
+    int n;
+    if (history <= 0 || !log_path[0]) return;
+    if (GetFileAttributesW(log_path) == INVALID_FILE_ATTRIBUTES) return;   /* no previous log */
+
+    wcscpy(dir, log_path);
+    sep = NULL;
+    for (wchar_t *p = dir; *p; p++)
+        if (*p == L'\\' || *p == L'/') sep = p;
+    if (sep) {
+        set_value(name, ARRAYSIZE(name), L"log", sep + 1);
+        *sep = L'\0';
+    } else {
+        set_value(name, ARRAYSIZE(name), L"log", dir);
+        wcscpy(dir, L".");
+    }
+    set_value(base, ARRAYSIZE(base), L"log", name);
+    ext[0] = L'\0';
+    dot = wcsrchr(base, L'.');
+    if (dot && dot != base) {           /* a leading dot is part of the name */
+        set_value(ext, ARRAYSIZE(ext), L"ext", dot);
+        *dot = L'\0';
+    }
+
+    n = _snwprintf(logs_dir, ARRAYSIZE(logs_dir), L"%ls\\logs", dir);
+    if (n <= 0 || (size_t)n >= ARRAYSIZE(logs_dir)) return;
+    CreateDirectoryW(logs_dir, NULL);
+
+    if (!file_time_stamp(log_path, stamp, ARRAYSIZE(stamp))) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        _snwprintf(stamp, ARRAYSIZE(stamp), L"%04u%02u%02u_%02u%02u%02u",
+                   st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        stamp[ARRAYSIZE(stamp) - 1] = L'\0';
+    }
+    for (int i = 0; i < 100; i++) {         /* a counter avoids same-second clashes */
+        if (i == 0)
+            n = _snwprintf(dest, ARRAYSIZE(dest), L"%ls\\%ls_%ls%ls", logs_dir, base, stamp, ext);
+        else
+            n = _snwprintf(dest, ARRAYSIZE(dest), L"%ls\\%ls_%ls_%d%ls", logs_dir, base, stamp, i, ext);
+        if (n <= 0 || (size_t)n >= ARRAYSIZE(dest)) return;
+        if (GetFileAttributesW(dest) == INVALID_FILE_ATTRIBUTES) break;
+    }
+    if (!MoveFileW(log_path, dest)) {
+        dbg(L"Couldn't move the previous log into logs\\ (%ls)", err_text(GetLastError()));
+        return;
+    }
+    prune_logs(logs_dir, base, ext, history);
+}
+
+/* last_run.ini: a small machine-readable record of the most recent launch,
+ * for the Mythix launcher to read. Overwritten each run. */
+static void write_last_run(const wchar_t *dir, const Config *cfg, const SYSTEMTIME *start,
+                           ULONGLONG start_tick, DWORD exit_code, int launched, int outlived) {
+    wchar_t path[MAX_PATH_W], line[MAX_PATH_W + 64];
+    SYSTEMTIME now;
+    ULONGLONG secs;
+    int exit_known;
+    const wchar_t *meaning;
+    int n;
+    HANDLE h;
+    if (!cfg->last_run || !dir[0]) return;
+    n = _snwprintf(path, ARRAYSIZE(path), L"%ls\\last_run.ini", dir);
+    if (n <= 0 || (size_t)n >= ARRAYSIZE(path)) return;
+    h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        dbg(L"Couldn't write last_run.ini (%ls)", err_text(GetLastError()));
+        return;
+    }
+    GetLocalTime(&now);
+    secs = (GetTickCount64() - start_tick) / 1000;
+    exit_known = cfg->persist && launched;      /* otherwise the loader didn't wait */
+    meaning = exit_known ? exit_meaning(exit_code) : NULL;
+
+#define LR(...) do { _snwprintf(line, ARRAYSIZE(line), __VA_ARGS__); \
+                     line[ARRAYSIZE(line) - 1] = L'\0'; write_utf8(h, line); } while (0)
+    LR(L"# Written by mythix-loader after the most recent launch. Overwritten each\r\n"
+       L"# run; the Mythix launcher reads it. Safe to delete.\r\n[LastRun]\r\n");
+    LR(L"LoaderVersion=" LOADER_VERSION L"\r\n");
+    LR(L"Exe=%ls\r\n", cfg->exe);
+    LR(L"AppId=%ls\r\n", cfg->app_id);
+    LR(L"Started=%04u-%02u-%02u %02u:%02u:%02u\r\n",
+       start->wYear, start->wMonth, start->wDay, start->wHour, start->wMinute, start->wSecond);
+    LR(L"Finished=%04u-%02u-%02u %02u:%02u:%02u\r\n",
+       now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+    LR(L"DurationSeconds=%llu\r\n", secs);
+    LR(L"Launched=%d\r\n", launched ? 1 : 0);
+    LR(L"Persist=%d\r\n", cfg->persist ? 1 : 0);
+    LR(L"WaitForChildren=%d\r\n", cfg->wait_children ? 1 : 0);
+    LR(L"OutlivedExe=%d\r\n", outlived ? 1 : 0);
+    LR(L"ExitKnown=%d\r\n", exit_known ? 1 : 0);
+    if (exit_known) {
+        LR(L"ExitCode=%lu\r\n", exit_code);
+        LR(L"ExitCodeHex=0x%08lX\r\n", exit_code);
+        LR(L"ExitMeaning=%ls\r\n", meaning ? meaning : L"");
+    }
+#undef LR
+    CloseHandle(h);
+}
+
 /* SingleInstance: one loader per profile at a time. If another one is
  * already running (its game still going), wait for it and return 1 so this
  * one exits without starting a second copy. Waiting instead of exiting keeps
@@ -588,17 +785,85 @@ static int wait_for_running_instance(const wchar_t *ini_full, const wchar_t *log
     return 1;
 }
 
-/* RunBefore/RunAfter: run a command line and wait for it. */
-static void run_command(const wchar_t *what, const wchar_t *cmd, const wchar_t *dir) {
+/* The program token off the front of a command line (a leading "quoted path"
+ * is taken whole). Returns a pointer into cmd at the arguments that follow. */
+static const wchar_t *first_token(const wchar_t *cmd, wchar_t *prog, size_t cap) {
+    const wchar_t *p = cmd;
+    size_t n = 0;
+    while (*p == L' ' || *p == L'\t') p++;
+    if (*p == L'"') {
+        for (p++; *p && *p != L'"'; p++)
+            if (n + 1 < cap) prog[n++] = *p;
+        if (*p == L'"') p++;
+    } else {
+        for (; *p && *p != L' ' && *p != L'\t'; p++)
+            if (n + 1 < cap) prog[n++] = *p;
+    }
+    prog[n] = L'\0';
+    return p;                               /* at the arguments (leading space kept) */
+}
+
+/* A bare name has no path of its own, so it can be looked up in scripts/. */
+static int is_bare_name(const wchar_t *s) {
+    return s[0] && !wcspbrk(s, L"\\/:");
+}
+
+static int ends_with_ci(const wchar_t *s, const wchar_t *suffix) {
+    size_t ls = wcslen(s), lf = wcslen(suffix);
+    return ls >= lf && _wcsicmp(s + ls - lf, suffix) == 0;
+}
+
+/* RunBefore/RunAfter: run a command line and wait for it. A bare program name
+ * is taken from the profile's scripts/ folder when it's there; .bat/.cmd
+ * scripts are run through the command processor. */
+static void run_command(const wchar_t *what, const wchar_t *cmd, const wchar_t *dir,
+                        const wchar_t *scripts_dir) {
+    static wchar_t line[MAX_CMD_LINE], inner[MAX_CMD_LINE];
+    wchar_t prog[MAX_PATH_W], resolved[MAX_PATH_W], comspec[MAX_PATH_W];
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
+    const wchar_t *args, *prog_name, *app;
+    int have_resolved = 0, is_batch;
     if (!cmd[0]) return;
-    wchar_t *line = _wcsdup(cmd);           /* CreateProcessW may write to it */
-    if (!line) return;
+
+    args = first_token(cmd, prog, ARRAYSIZE(prog));
+    if (is_bare_name(prog) && scripts_dir && scripts_dir[0]) {
+        int n = _snwprintf(resolved, ARRAYSIZE(resolved), L"%ls\\%ls", scripts_dir, prog);
+        if (n > 0 && (size_t)n < ARRAYSIZE(resolved)) {
+            DWORD at = GetFileAttributesW(resolved);
+            if (at != INVALID_FILE_ATTRIBUTES && !(at & FILE_ATTRIBUTE_DIRECTORY)) {
+                have_resolved = 1;
+                dbg(L"%ls: found %ls in the profile's scripts folder", what, prog);
+            }
+        }
+    }
+    prog_name = have_resolved ? resolved : prog;
+    is_batch = ends_with_ci(prog_name, L".bat") || ends_with_ci(prog_name, L".cmd");
+
+    if (is_batch) {
+        /* A .bat/.cmd isn't an executable image; run it through cmd.exe. With
+         * /s and the whole command wrapped in quotes, cmd takes the rest as
+         * typed, so a quoted script path with spaces survives. */
+        if (have_resolved) {
+            _snwprintf(inner, ARRAYSIZE(inner), L"\"%ls\"%ls", resolved, args);
+            inner[ARRAYSIZE(inner) - 1] = L'\0';
+        } else {
+            set_value(inner, ARRAYSIZE(inner), what, cmd);
+        }
+        if (!GetEnvironmentVariableW(L"ComSpec", comspec, ARRAYSIZE(comspec)))
+            wcscpy(comspec, L"cmd.exe");
+        _snwprintf(line, ARRAYSIZE(line), L"\"%ls\" /s /c \"%ls\"", comspec, inner);
+        line[ARRAYSIZE(line) - 1] = L'\0';
+        app = comspec;
+    } else {
+        set_value(line, ARRAYSIZE(line), what, cmd);    /* CreateProcessW may write to it */
+        app = have_resolved ? resolved : NULL;          /* bare name, else let it search */
+    }
+
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     mlog(L"%ls: %ls", what, cmd);
-    if (!CreateProcessW(NULL, line, NULL, NULL, FALSE, 0, NULL, dir[0] ? dir : NULL, &si, &pi)) {
+    if (!CreateProcessW(app, line, NULL, NULL, FALSE, 0, NULL, dir[0] ? dir : NULL, &si, &pi)) {
         mlog(L"Warning: %ls couldn't start (%ls)", what, err_text(GetLastError()));
     } else if (!pi.hProcess) {
         /* Wine runs a Linux program or script as a Unix process and hands
@@ -613,7 +878,6 @@ static void run_command(const wchar_t *what, const wchar_t *cmd, const wchar_t *
         CloseHandle(pi.hProcess);
         if (pi.hThread) CloseHandle(pi.hThread);
     }
-    free(line);
 }
 
 /* ── Environment setup ─────────────────────────────────────────────────── */
@@ -1027,7 +1291,8 @@ static int tree_wait(ProcessTree *t, const PROCESS_INFORMATION *pi) {
 }
 
 static DWORD launch_game(Config *cfg, const wchar_t *run_dir, int extra_argc,
-                         wchar_t **extra_argv, int *launched) {
+                         wchar_t **extra_argv, int *launched, int *outlived_out) {
+    if (outlived_out) *outlived_out = 0;
     /* Exe and ExeCommandLine are each capped at MAX_PATH_W, so this always fits. */
     static wchar_t cmd_line[MAX_CMD_LINE];
     if (cfg->exe_cmd_line[0]) {
@@ -1129,6 +1394,7 @@ static DWORD launch_game(Config *cfg, const wchar_t *run_dir, int extra_argc,
     if (cfg->persist) {
         dbg(L"Waiting for the game%ls to exit...", track ? L" and the processes it starts" : L"");
         int outlived = track ? tree_wait(&tree, &pi) : 0;
+        if (outlived_out) *outlived_out = outlived;
         WaitForSingleObject(pi.hProcess, INFINITE);     /* already done when tracking */
         GetExitCodeProcess(pi.hProcess, &exit_code);
         if (outlived)
@@ -1145,7 +1411,10 @@ static DWORD launch_game(Config *cfg, const wchar_t *run_dir, int extra_argc,
 /* ── Main ──────────────────────────────────────────────────────────────── */
 
 int wmain(int argc, wchar_t *argv[]) {
-    mlog(L"Mythix Loader v1.5");
+    SYSTEMTIME start_lt;
+    ULONGLONG start_tick = GetTickCount64();
+    GetLocalTime(&start_lt);
+    mlog(L"Mythix Loader v" LOADER_VERSION);
 
     /* Find our own directory for the ini */
     wchar_t self_dir[MAX_PATH_W];
@@ -1229,6 +1498,7 @@ int wmain(int argc, wchar_t *argv[]) {
             return 0;
         }
     }
+    rotate_logs(cfg.log_file, cfg.log_history);     /* keep the last few in logs/ */
     open_log_file(cfg.log_file, 0);
 
     expand_vars(cfg.exe_cmd_line, ARRAYSIZE(cfg.exe_cmd_line), L"ExeCommandLine");
@@ -1239,26 +1509,33 @@ int wmain(int argc, wchar_t *argv[]) {
     /* Load any extra DLLs (into the loader only) */
     load_extra_dlls(&cfg);
 
+    /* A bare RunBefore/RunAfter name is looked up in the profile's scripts/. */
+    wchar_t scripts_dir[MAX_PATH_W];
+    int sn = _snwprintf(scripts_dir, ARRAYSIZE(scripts_dir), L"%ls\\scripts", ini_dir);
+    if (sn <= 0 || (size_t)sn >= ARRAYSIZE(scripts_dir)) scripts_dir[0] = L'\0';
+
     /* Default to the exe's own folder, like starting it from Explorer. */
     const wchar_t *run_dir = cfg.exe_run_dir[0] ? cfg.exe_run_dir : game_dir;
-    run_command(L"RunBefore", cfg.run_before, run_dir);
+    run_command(L"RunBefore", cfg.run_before, run_dir, scripts_dir);
 
     /* Launch the game */
-    int launched = 0;
-    DWORD result = launch_game(&cfg, run_dir, n_extra, extra, &launched);
+    int launched = 0, outlived = 0;
+    DWORD result = launch_game(&cfg, run_dir, n_extra, extra, &launched, &outlived);
 
     /* RunAfter: once the game has exited, or right away if it didn't start
      * (so a RunBefore/RunAfter pair still cleans up). */
     if (cfg.run_after[0]) {
         if (!launched) {
             mlog(L"The game didn't start; running RunAfter anyway");
-            run_command(L"RunAfter", cfg.run_after, run_dir);
+            run_command(L"RunAfter", cfg.run_after, run_dir, scripts_dir);
         } else if (cfg.persist) {
-            run_command(L"RunAfter", cfg.run_after, run_dir);
+            run_command(L"RunAfter", cfg.run_after, run_dir, scripts_dir);
         } else {
             mlog(L"Note: RunAfter needs Persist=1 (the loader doesn't wait for the game); skipped");
         }
     }
+
+    write_last_run(ini_dir, &cfg, &start_lt, start_tick, result, launched, outlived);
 
     free(extra);
     return (int)result;

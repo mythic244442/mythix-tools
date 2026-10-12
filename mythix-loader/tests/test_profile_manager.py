@@ -272,7 +272,10 @@ class CreateProfileTests(ProfileTestCase):
             os.makedirs(os.path.dirname(os.path.join(profile, rel)), exist_ok=True)
             open(os.path.join(profile, rel), "wb").close()
         plan = self.create(inst)
-        self.assertEqual(sorted(os.listdir(profile)), ["mythix_loader.ini", "spacewar.exe"])
+        # The old steamclient copies and the client/ dir are gone; what's left
+        # is the clean profile plus the v1.6 folders.
+        self.assertEqual(sorted(os.listdir(profile)),
+                         ["README.txt", "logs", "mythix_loader.ini", "scripts", "spacewar.exe"])
         ini = self.read_ini(plan)
         for retired in ("SteamClientDll", "SteamClient64Dll", "ForceArch", "NoInject"):
             self.assertNotIn(retired, ini)
@@ -298,6 +301,49 @@ class CreateProfileTests(ProfileTestCase):
                      "Affinity": "", "RunBefore": "", "RunAfter": "", "ExtraDlls": "",
                      "Persist": "1", "WaitForChildren": "1"}.items():
             self.assertEqual(ini.get(k), v, k)
+
+    def test_new_profile_fills_the_folder(self):
+        inst = self.steam.install(480, "Spacewar", "Spacewar")
+        make_pe(os.path.join(inst, "Spacewar.exe"))
+        plan = self.create(inst)
+        d = plan["profile_dir"]
+        self.assertTrue(os.path.isdir(os.path.join(d, "logs")))
+        self.assertTrue(os.path.isdir(os.path.join(d, "scripts")))
+        self.assertTrue(os.path.isfile(os.path.join(d, "scripts", "example.bat")))
+        with open(os.path.join(d, "README.txt"), encoding="utf-8") as f:
+            readme = f.read()
+        self.assertIn("Spacewar", readme)
+        self.assertIn("480", readme)
+        self.assertIn("scripts/", readme)
+        ini = self.read_ini(plan)
+        self.assertEqual(ini.get("LogHistory"), "10")
+        self.assertEqual(ini.get("LastRun"), "1")
+
+    def test_example_script_is_kept_but_readme_regenerated_on_refresh(self):
+        inst = self.steam.install(480, "Spacewar", "Spacewar")
+        make_pe(os.path.join(inst, "Spacewar.exe"))
+        plan = self.create(inst)
+        example = os.path.join(plan["profile_dir"], "scripts", "example.bat")
+        with open(example, "w", encoding="utf-8") as f:
+            f.write("@echo off\nrem my own edits\n")
+        readme = os.path.join(plan["profile_dir"], "README.txt")
+        os.remove(readme)
+        self.create(inst)
+        with open(example, encoding="utf-8") as f:
+            self.assertIn("my own edits", f.read())     # a user's edits survive
+        self.assertTrue(os.path.isfile(readme))          # README comes back
+
+    def test_loghistory_and_lastrun_carry_over(self):
+        inst = self.steam.install(480, "Spacewar", "Spacewar")
+        make_pe(os.path.join(inst, "Spacewar.exe"))
+        plan = self.create(inst)
+        with open(plan["ini_path"], encoding="utf-8") as f:
+            text = f.read().replace("LogHistory=10", "LogHistory=3").replace("LastRun=1", "LastRun=0")
+        with open(plan["ini_path"], "w", encoding="utf-8") as f:
+            f.write(text)
+        ini = self.read_ini(self.create(inst))
+        self.assertEqual(ini["LogHistory"], "3")
+        self.assertEqual(ini["LastRun"], "0")
 
     def test_refresh_keeps_user_settings(self):
         inst = self.steam.install(480, "Spacewar", "Spacewar")

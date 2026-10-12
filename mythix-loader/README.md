@@ -51,6 +51,23 @@ SteamAppId=<appid> <compat_tool>/neutron waitforexitandrun "<profile>/<stub>.exe
 `SteamAppId` matters here: without it neutron skips its `steam.exe` shim,
 which is what registers the Steam client for the game.
 
+## Profile folder
+
+```
+<name>/
+  <stub>.exe           the loader (a copy of mythix_loader.exe)
+  mythix_loader.ini    the settings below
+  last_run.ini         the most recent launch's result (LastRun)
+  logs/                recent launch logs (LogHistory)
+  scripts/             RunBefore/RunAfter helpers, with a commented example.bat
+  README.txt           a plain-text summary of this profile
+```
+
+The loader itself only needs the stub and the ini; the rest is written by
+`mythix-loader` and filled in as the game runs, and all of it is safe to
+delete. Re-running `mythix-loader` on the game recreates the folders and
+`README.txt` and leaves `scripts/example.bat` alone once you've edited it.
+
 ## mythix_loader.ini
 
 ```ini
@@ -68,6 +85,8 @@ Affinity=
 RunBefore=
 RunAfter=
 LogFile=mythix_loader.log
+LogHistory=10
+LastRun=1
 Debug=0
 ExtraDlls=
 ```
@@ -90,6 +109,8 @@ value, so don't put a comment at the end of a line.
 | `RunBefore` | | Command run, and waited for, before the game |
 | `RunAfter` | | Command run after the game exits (needs `Persist=1`) |
 | `LogFile` | (none) | The loader's log, also written to this file |
+| `LogHistory` | 10 | How many previous logs to keep in a `logs/` folder (0 = none) |
+| `LastRun` | 1 | Write `last_run.ini` (time, duration, exit code) after each launch |
 | `Debug` | 0 | More detail in the log |
 | `ExtraDlls` | | DLLs loaded into the loader process only, **not** the game |
 
@@ -113,6 +134,15 @@ can move.
   launch. It's useful under the Mythix launcher, which discards the loader's
   output unless `MYTHIX_CAPTURE_GAME_OUTPUT=1` is set. Exit codes that mean a
   crash are named, e.g. `0xC0000005 (access violation: the game crashed)`.
+- **LogHistory** keeps the last few launches around: before a run empties
+  `LogFile`, the previous one is moved into a `logs/` folder beside it, named
+  with its own time stamp, and only the newest `LogHistory` are kept (0 keeps
+  none, so only the current `LogFile` remains). The live log stays at
+  `LogFile`; `logs/` holds the runs before it.
+- **LastRun** writes `last_run.ini` in the profile folder after each launch — a
+  small machine-readable record (start and finish time, duration, and, when the
+  loader waited, the exit code and what it means) for the Mythix launcher to
+  read. It's overwritten each run and safe to delete; set `LastRun=0` to skip it.
 - **SingleInstance** stops a second copy of the same profile while the game is
   still running. The second launch adds a note to the log, waits for the
   running one, and then exits without starting anything. Waiting (instead of
@@ -124,12 +154,14 @@ can move.
   Under Wine the priority class is set (the game sees it), but it usually
   doesn't change real CPU scheduling.
 - **RunBefore** / **RunAfter** run a Windows command line in the game's
-  working directory, with the game's environment, and wait for it. Give a full
-  path, or `%MYTHIX_GAME_DIR%\tool.exe`: a bare name is looked up next to the
-  loader and on `PATH`, not in the game folder. Quote paths with spaces:
-  `"C:\tools dir\backup.exe" "%MYTHIX_GAME_DIR%"`. Under Wine a Linux program
-  or script can be started too, but the loader can't wait for it or see its
-  exit code. `RunAfter` runs once the game has exited, or right away if it
+  working directory, with the game's environment, and wait for it. A bare name
+  (e.g. `backup.bat`) is looked up in the profile's own `scripts/` folder
+  first, then next to the loader and on `PATH` — never in the game folder; or
+  give a full path, or `%MYTHIX_GAME_DIR%\tool.exe`. `.bat` and `.cmd` scripts
+  are run through the command processor, so they work too. Quote paths with
+  spaces: `"C:\tools dir\backup.exe" "%MYTHIX_GAME_DIR%"`. Under Wine a Linux
+  program or script can be started too, but the loader can't wait for it or see
+  its exit code. `RunAfter` runs once the game has exited, or right away if it
   couldn't start. Avoid commands that leave something running: through
   neutron's `steam.exe` shim that keeps the session alive, and after a direct
   launch neutron kills it with the prefix.
