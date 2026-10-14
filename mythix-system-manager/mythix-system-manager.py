@@ -142,6 +142,30 @@ DEBIAN_NEXT_CODENAME = {
     "trixie":   "forky",
 }
 
+# Linux Mint release progression (version → codename), in release order.
+# Mint point releases are sequential; mintupgrade itself has shipped stale
+# metadata (offering Wilma to Zena users), so we keep our own map and treat
+# mintupgrade's output as advisory only.
+MINT_RELEASES = [
+    ("21",    "vanessa"),
+    ("21.1",  "vera"),
+    ("21.2",  "victoria"),
+    ("21.3",  "virginia"),
+    ("22",    "wilma"),
+    ("22.1",  "xia"),
+    ("22.2",  "zara"),
+    ("22.3",  "zena"),
+]
+MINT_LATEST = MINT_RELEASES[-1]
+
+
+def mint_release_index(version):
+    """Index of version in MINT_RELEASES, or None if unknown."""
+    for i, (v, _cn) in enumerate(MINT_RELEASES):
+        if v == version:
+            return i
+    return None
+
 
 def detect_distro():
     """Identify the running distribution.
@@ -2911,7 +2935,18 @@ class SystemManager(Gtk.Window):
             has_tool = subprocess.run(
                 ["which", "mintupgrade"], capture_output=True).returncode == 0
             tool_text = "mintupgrade: available" if has_tool else "mintupgrade: not installed"
-            if has_tool:
+            idx = mint_release_index(info["version"])
+            if idx is not None and idx >= len(MINT_RELEASES) - 1:
+                status_text = (
+                    f"You are on the latest known Mint release ({MINT_LATEST[0]} "
+                    f"{MINT_LATEST[1].capitalize()}). Nothing to upgrade to.")
+            elif idx is not None:
+                nv, ncn = MINT_RELEASES[idx + 1]
+                status_text = (
+                    f"Next release for you: Mint {nv} {ncn.capitalize()}. "
+                    + ("Click Check to confirm with mintupgrade." if has_tool else
+                       "mintupgrade is not installed. Click Check to install it and look for upgrades."))
+            elif has_tool:
                 status_text = (
                     "mintupgrade is installed. Use Check to see if a new release is available.")
             else:
@@ -2972,8 +3007,9 @@ class SystemManager(Gtk.Window):
         self._uplog(f"Failed to install mintupgrade:\n{r.stderr.strip()}")
         return False
 
-    def _stream_mintupgrade(self, args):
-        """Run mintupgrade <args>, stream output to uplog. Returns exit code."""
+    def _stream_mintupgrade(self, args, collect=None):
+        """Run mintupgrade <args>, stream output to uplog. Returns exit code.
+        If collect is a list, each output line is also appended to it."""
         cmd = ["mintupgrade"] + args
         self._uplog(f"Running: {' '.join(cmd)}")
         proc = subprocess.Popen(
@@ -2983,6 +3019,8 @@ class SystemManager(Gtk.Window):
             line = line.rstrip()
             if line:
                 self._uplog(line)
+                if collect is not None:
+                    collect.append(line)
         proc.wait()
         return proc.returncode
 
@@ -3167,10 +3205,30 @@ class SystemManager(Gtk.Window):
     def _upg_check_worker(self):
         self._uplog("─" * 50)
         self._uplog("Checking for available upgrades…")
+
+        info = detect_distro()
+        idx = mint_release_index(info["version"])
+        if idx is not None and idx >= len(MINT_RELEASES) - 1:
+            self._uplog(f"You are already on the latest known Mint release "
+                        f"({MINT_LATEST[0]} {MINT_LATEST[1].capitalize()}).")
+            self._uplog("mintupgrade's metadata can go stale and offer older "
+                        "releases (e.g. Wilma) — ignoring it.")
+            self._upg_set_buttons()
+            GLib.idle_add(self.upg_status_lbl.set_text,
+                          f"Up to date — Mint {MINT_LATEST[0]} is the latest release.")
+            return
+
         if not self._ensure_mintupgrade():
             self._upg_set_buttons(); return
-        rc = self._stream_mintupgrade(["check"])
-        if rc == 0:
+        output = []
+        rc = self._stream_mintupgrade(["check"], collect=output)
+        if rc == 0 and self._mintupgrade_offer_is_stale(info, output):
+            self._uplog("⚠ mintupgrade offered a release that is not newer than "
+                        "your current version — its metadata is stale. Ignoring.")
+            self._upg_set_buttons()
+            GLib.idle_add(self.upg_status_lbl.set_text,
+                          "Up to date (mintupgrade's offer was stale and was ignored).")
+        elif rc == 0:
             self._uplog("✓ An upgrade is available. You can proceed with Download.")
             self._upg_set_buttons(check=True, download=True, go=False, simulate=True)
             GLib.idle_add(self.upg_status_lbl.set_text,
@@ -3190,6 +3248,18 @@ class SystemManager(Gtk.Window):
                   if detect_distro()["id"] == "debian"
                   else self._upg_simulate_worker)
         threading.Thread(target=target, daemon=True).start()
+
+    def _mintupgrade_offer_is_stale(self, info, output_lines):
+        """True if mintupgrade's offered target is not newer than the current
+        Mint release according to MINT_RELEASES (i.e. stale metadata)."""
+        cur_idx = mint_release_index(info["version"])
+        if cur_idx is None:
+            return False
+        text = " ".join(output_lines).lower()
+        for i, (v, cn) in enumerate(MINT_RELEASES):
+            if cn in text and i <= cur_idx:
+                return True
+        return False
 
     def _upg_simulate_worker(self):
         self._uplog("─" * 50)
