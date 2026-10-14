@@ -41,3 +41,33 @@ python3 mythix-system-manager.py
 
 All config writes are atomic and backed up first (`write_text_with_backup`),
 so a bad edit never leaves a half-written system file.
+
+## Layout
+
+```
+mythix-system-manager/
+  mythix-system-manager.py   thin launcher (re-execs via pkexec if not root)
+  system_manager/
+    core.py                  constants, settings, atomic-write helpers,
+                             distro detection, Mint/Debian release maps
+    app.py                   AppBase (window skeleton, CSS, tray, palette
+                             wiring) + SystemManager composing all mixins
+    pages/
+      palette.py             Ctrl+K command palette
+      overview.py            HOME dashboard (stat cards, sparkline)
+      updates.py             apt + flatpak updates
+      packages.py            installed package browser, apt-mark hold
+      cleanup.py             disk cleanup
+      history.py             install history
+      kernels.py             kernel manager
+      repos.py               APT repository manager
+      startup.py             startup entry manager
+      upgrade.py             distro upgrade (mintupgrade / Debian codename swap)
+      security.py            security toggles + score
+      antivirus.py           ClamAV scanning
+      logs.py                journald viewer
+      sysinfo.py             system info with live refresh
+```
+
+Each page is a mixin class; `SystemManager` in `app.py` composes them all over
+`AppBase`. Shared imports and constants come from `core.py`.
