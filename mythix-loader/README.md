@@ -33,6 +33,8 @@ mythix-loader "<install dir>" --dry-run    # show the plan, write nothing
 mythix-loader "<install dir>" --exe bin/Game.exe --name mygame
 mythix-loader --launch-info appid          # Steam's launch entries for an appid
 mythix-loader --list                       # existing profiles
+mythix-loader --saves <profile>            # symlink the game's saves into the profile
+mythix-loader --saves <profile> --copy     # ...snapshot a copy instead
 mythix-loader --setup                      # check loader exes + Steam install
 ```
 
@@ -59,6 +61,7 @@ which is what registers the Steam client for the game.
   mythix_loader.ini    the settings below
   last_run.ini         the most recent launch's result (LastRun)
   logs/                recent launch logs (LogHistory)
+  saves/               the game's save folders (filled by --saves)
   scripts/             RunBefore/RunAfter helpers, with a commented example.bat
   README.txt           a plain-text summary of this profile
 ```
@@ -67,6 +70,28 @@ The loader itself only needs the stub and the ini; the rest is written by
 `mythix-loader` and filled in as the game runs, and all of it is safe to
 delete. Re-running `mythix-loader` on the game recreates the folders and
 `README.txt` and leaves `scripts/example.bat` alone once you've edited it.
+
+## Saves
+
+`mythix-loader --saves <profile>` finds where the game keeps its saves and
+drops them into the profile's `saves/` folder, so they're one click away (and
+easy to back up). It never changes or deletes your real saves.
+
+Save locations come from Steam itself: each game's cloud-save (UFS) config in
+`appinfo.vdf` lists the folders it saves to (`WinMyDocuments`,
+`WinAppDataRoaming`, `WinSavedGames`, the install dir, …), which the manager
+resolves against the game's Proton prefix
+(`steamapps/compatdata/<appid>/pfx`). A game with no cloud config falls back to
+a careful name match in the prefix's user folders. The game has to have run at
+least once (so the prefix and saves exist).
+
+- By default each save folder is **symlinked** into `saves/<name>` — live, no
+  duplication, and editing through it edits the real saves.
+- `--copy` instead writes a **snapshot** into `saves/backups/<timestamp>/` — a
+  real, separate backup you can keep or restore by hand.
+- It's safe to re-run: a symlink that already points at the right place is left
+  alone, and a real folder you've put in `saves/` yourself is never overwritten.
+- `--json` prints the result (used by the launcher).
 
 ## mythix_loader.ini
 
