@@ -114,13 +114,20 @@ class FakeSteam:
         os.makedirs(os.path.join(home, ".steam"))
         os.symlink(self.root, os.path.join(home, ".steam", "steam"))
 
-    def install(self, appid, name, installdir, launch=None):
-        self.apps[appid] = (name, installdir, launch)
+    def install(self, appid, name, installdir, launch=None, ufs=None):
+        self.apps[appid] = (name, installdir, launch, ufs)
         with open(os.path.join(self.root, "steamapps", f"appmanifest_{appid}.acf"), "w") as f:
             f.write('"AppState"\n{\n\t"appid"\t\t"%d"\n\t"name"\t\t"%s"\n'
                     '\t"StateFlags"\t\t"4"\n\t"installdir"\t\t"%s"\n}\n' % (appid, name, installdir))
         self._write_indexes()
         return os.path.join(self.root, "steamapps", "common", installdir)
+
+    def make_prefix(self, appid):
+        """A fake Proton prefix for the app; returns its drive_c users/steamuser dir."""
+        user = os.path.join(self.root, "steamapps", "compatdata", str(appid),
+                            "pfx", "drive_c", "users", "steamuser")
+        os.makedirs(user, exist_ok=True)
+        return user
 
     def _write_indexes(self):
         apps = "".join('\t\t\t"%d"\t\t"1"\n' % a for a in self.apps)
@@ -128,10 +135,12 @@ class FakeSteam:
             f.write('"libraryfolders"\n{\n\t"0"\n\t{\n\t\t"path"\t\t"%s"\n'
                     '\t\t"apps"\n\t\t{\n%s\t\t}\n\t}\n}\n' % (self.root, apps))
         info = {}
-        for appid, (name, _, launch) in self.apps.items():
+        for appid, (name, _, launch, ufs) in self.apps.items():
             entry = {"appid": appid, "common": {"name": name, "type": "Game"}}
             if launch:
                 entry["config"] = {"launch": {str(i): l for i, l in enumerate(launch)}}
+            if ufs:
+                entry["ufs"] = ufs
             info[appid] = entry
         make_appinfo(os.path.join(self.root, "appcache", "appinfo.vdf"), info)
 
@@ -275,7 +284,7 @@ class CreateProfileTests(ProfileTestCase):
         # The old steamclient copies and the client/ dir are gone; what's left
         # is the clean profile plus the v1.6 folders.
         self.assertEqual(sorted(os.listdir(profile)),
-                         ["README.txt", "logs", "mythix_loader.ini", "scripts", "spacewar.exe"])
+                         ["README.txt", "logs", "mythix_loader.ini", "saves", "scripts", "spacewar.exe"])
         ini = self.read_ini(plan)
         for retired in ("SteamClientDll", "SteamClient64Dll", "ForceArch", "NoInject"):
             self.assertNotIn(retired, ini)
@@ -500,6 +509,122 @@ class CliTests(ProfileTestCase):
         r = self.run_cli(inst, "--json", "--appid", "abc")
         self.assertEqual(r.returncode, 1)
         self.assertFalse(json.loads(r.stdout)["ok"])
+
+
+class SavesTests(ProfileTestCase):
+    SPACEWAR_UFS = {"savefiles": {"0": {"root": "WinMyDocuments", "path": "My Games\\Spacewar"}}}
+
+    def _setup(self, appid=480, ufs=None):
+        inst = self.steam.install(appid, "Spacewar", "Spacewar", ufs=ufs)
+        make_pe(os.path.join(inst, "Spacewar.exe"))
+        plan = self.create(inst)
+        user = self.steam.make_prefix(appid)
+        return plan, inst, user
+
+    def _run(self, name, **kw):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return ml.run_saves(name, **kw)
+
+    def run_cli(self, *args):
+        env = dict(os.environ, HOME=self.home, PYTHONDONTWRITEBYTECODE="1")
+        return subprocess.run([sys.executable, SCRIPT, *args], capture_output=True,
+                              text=True, encoding="utf-8", env=env)
+
+    def test_symlinks_saves_from_steam_cloud_config(self):
+        plan, inst, user = self._setup(ufs=self.SPACEWAR_UFS)
+        save_dir = os.path.join(user, "Documents", "My Games", "Spacewar")
+        os.makedirs(save_dir)
+        with open(os.path.join(save_dir, "save1.dat"), "w") as f:
+            f.write("hi")
+        res = self._run(plan["profile_name"])
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["source"], "steam-cloud")
+        self.assertEqual(len(res["saves"]), 1)
+        link = res["saves"][0]["dest"]
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.path.realpath(link), os.path.realpath(save_dir))
+        self.assertTrue(os.path.isfile(os.path.join(link, "save1.dat")))   # reachable through it
+        self.assertEqual(res["saves"][0]["mode"], "symlink")
+
+    def test_symlink_is_idempotent(self):
+        plan, inst, user = self._setup(ufs=self.SPACEWAR_UFS)
+        os.makedirs(os.path.join(user, "Documents", "My Games", "Spacewar"))
+        self._run(plan["profile_name"])
+        res = self._run(plan["profile_name"])                 # second run, same target
+        self.assertEqual(res["saves"][0]["state"], "ok")
+
+    def test_copy_snapshots_without_touching_originals(self):
+        plan, inst, user = self._setup(ufs=self.SPACEWAR_UFS)
+        save_dir = os.path.join(user, "Documents", "My Games", "Spacewar")
+        os.makedirs(save_dir)
+        with open(os.path.join(save_dir, "save1.dat"), "w") as f:
+            f.write("payload")
+        res = self._run(plan["profile_name"], copy=True)
+        self.assertTrue(res["copy"])
+        dest = res["saves"][0]["dest"]
+        self.assertFalse(os.path.islink(dest))                # a real copy, not a link
+        with open(os.path.join(dest, "save1.dat")) as f:
+            self.assertEqual(f.read(), "payload")
+        self.assertTrue(res["backup_dir"].startswith(
+            os.path.join(plan["profile_dir"], "saves", "backups")))
+        self.assertTrue(os.path.isfile(os.path.join(save_dir, "save1.dat")))   # original intact
+
+    def test_fallback_scan_by_name(self):
+        plan, inst, user = self._setup(ufs=None)              # no cloud config
+        save_dir = os.path.join(user, "Saved Games", "Spacewar")
+        os.makedirs(save_dir)
+        open(os.path.join(save_dir, "s.sav"), "w").close()
+        res = self._run(plan["profile_name"])
+        self.assertEqual(res["source"], "scan")
+        self.assertEqual(os.path.realpath(res["saves"][0]["dest"]), os.path.realpath(save_dir))
+
+    def test_none_when_nothing_matches(self):
+        plan, inst, user = self._setup(ufs=None)
+        os.makedirs(os.path.join(user, "Saved Games", "SomeOtherGame"))
+        res = self._run(plan["profile_name"])
+        self.assertEqual(res["source"], "none")
+        self.assertEqual(res["saves"], [])
+        self.assertTrue(res["ok"])
+
+    def test_does_not_clobber_a_real_folder(self):
+        plan, inst, user = self._setup(ufs=self.SPACEWAR_UFS)
+        os.makedirs(os.path.join(user, "Documents", "My Games", "Spacewar"))
+        existing = os.path.join(plan["profile_dir"], "saves", "spacewar")
+        os.makedirs(existing)
+        with open(os.path.join(existing, "mine.txt"), "w") as f:
+            f.write("keep me")
+        res = self._run(plan["profile_name"])
+        self.assertEqual(res["saves"][0]["state"], "blocked")
+        self.assertFalse(os.path.islink(existing))            # left as a real dir
+        self.assertTrue(os.path.isfile(os.path.join(existing, "mine.txt")))
+
+    def test_gamedata_root_resolves_against_install_dir(self):
+        plan, inst, user = self._setup(ufs={"savefiles": {"0": {"root": "gamedata", "path": "saves"}}})
+        save_dir = os.path.join(inst, "saves")
+        os.makedirs(save_dir)
+        open(os.path.join(save_dir, "g.sav"), "w").close()
+        res = self._run(plan["profile_name"])
+        self.assertEqual(res["source"], "steam-cloud")
+        self.assertEqual(os.path.realpath(res["saves"][0]["dest"]), os.path.realpath(save_dir))
+
+    def test_rejects_parent_traversal_in_save_path(self):
+        ufs = {"savefiles": {"0": {"root": "WinMyDocuments", "path": "..\\..\\..\\elsewhere"}}}
+        plan, inst, user = self._setup(ufs=ufs)
+        os.makedirs(os.path.join(user, "Documents"))      # the root exists; the entry still refused
+        res = self._run(plan["profile_name"])
+        self.assertEqual(res["saves"], [])                # no climbing out of the root
+        self.assertEqual(res["source"], "none")
+
+    def test_json_end_to_end(self):
+        plan, inst, user = self._setup(ufs=self.SPACEWAR_UFS)
+        os.makedirs(os.path.join(user, "Documents", "My Games", "Spacewar"))
+        r = self.run_cli("--saves", plan["profile_name"], "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["source"], "steam-cloud")
+        self.assertEqual(out["appid"], "480")
+        self.assertEqual(len(out["saves"]), 1)
 
 
 if __name__ == "__main__":
