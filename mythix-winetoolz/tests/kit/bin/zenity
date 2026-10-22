@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Mock zenity for the winetoolz test suite.
+#
+#  * Every call is appended to $ZMOCK_LOG as one line: "CALL <args...>", each
+#    argument %q-quoted, so tests can assert on titles, texts and list rows.
+#  * Interactive dialogs (--list, --question, --entry, --file-selection,
+#    --forms, --scale, --password, --color-selection, --calendar, an
+#    --editable --text-info) take the next scripted answer from $ZMOCK_QUEUE:
+#    one line per call, "<exit-code><TAB><stdout>", where stdout may use \n
+#    escapes. A missing or empty queue answers exit 1 — the user cancelled —
+#    so a menu loop under test can never spin forever.
+#  * --info / --error / --warning / --notification and a read-only
+#    --text-info answer OK (exit 0) without taking from the queue; --progress
+#    drains stdin and answers 0. Set ZMOCK_STRICT=1 to queue those too.
+#  * `zenity --version` prints a version and takes no answer.
+#  * Each dialog's text is also logged as one "TEXT <plain text>" line (markup
+#    removed, entities decoded, newlines shown as ⏎) for plain assertions.
+#  * --text is checked as Pango markup unless --no-markup is given. Bad markup
+#    (an unescaped & from a path or game name, unbalanced tags) is logged as
+#    "MARKUP_ERROR <reason>" — real zenity would show a broken/empty dialog —
+#    and tests assert it never appears.
+set -u
+
+log="${ZMOCK_LOG:-/dev/null}"
+queue="${ZMOCK_QUEUE:-}"
+
+{ printf 'CALL'; printf ' %q' "$@"; printf '\n'; } >> "$log"
+
+# `zenity --version` (the About module's dependency check) is not a dialog.
+if [[ "${1:-}" == --version ]]; then echo "4.0.1 (winetoolz test mock)"; exit 0; fi
+
+mode="" text="" markup=1 editable=0 has_filename=0
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+    a="${args[i]}"
+    case "$a" in
+        --info|--error|--warning|--notification|--question|--list|--entry|--progress|\
+        --file-selection|--forms|--scale|--password|--color-selection|--calendar|--text-info)
+            mode="${a#--}" ;;
+        --text=*)      text="${a#--text=}" ;;
+        --text)        text="${args[i+1]:-}"; ((i++)) ;;
+        --no-markup)   markup=0 ;;
+        --editable)    editable=1 ;;
+        --filename=*|--filename) has_filename=1 ;;
+    esac
+done
+
+# The dialog text as the user would read it, on one line, for assertions.
+if [[ -n "$text" ]]; then
+    plain="${text//$'\n'/ ⏎ }"
+    if (( markup )); then
+        plain="$(printf '%s' "$plain" | sed -e 's/<[^>]*>//g' -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&amp;/\&/g')"
+    fi
+    printf 'TEXT %s\n' "$plain" >> "$log"
+fi
+
+# Pango markup is a GMarkup (XML-subset) document: validate it as XML.
+if (( markup )) && [[ -n "$text" ]] && command -v python3 >/dev/null 2>&1; then
+    err="$(python3 - "$text" <<'PY' 2>&1
+import sys, xml.etree.ElementTree as ET
+try:
+    ET.fromstring("<markup>" + sys.argv[1] + "</markup>")
+except ET.ParseError as e:
+    print(e)
+PY
+)"
+    [[ -n "$err" ]] && printf 'MARKUP_ERROR %s :: %q\n' "$err" "$text" >> "$log"
+fi
+
+pop() {
+    # Print the queued stdout and return the queued exit code; cancel if empty.
+    local line code out
+    if [[ -n "$queue" && -s "$queue" ]]; then
+        IFS= read -r line < "$queue"
+        sed -i '1d' "$queue"
+        code="${line%%$'\t'*}"
+        out=""
+        [[ "$line" == *$'\t'* ]] && out="${line#*$'\t'}"
+        [[ -n "$out" ]] && printf '%b\n' "$out"
+        printf 'ANSWER %s %q\n' "$code" "$out" >> "$log"
+        return "$code"
+    fi
+    printf 'QUEUE_EMPTY %s\n' "$mode" >> "$log"
+    return 1
+}
+
+strict="${ZMOCK_STRICT:-0}"
+case "$mode" in
+    info|error|warning|notification)
+        (( strict )) && { pop; exit $?; }
+        exit 0 ;;
+    progress)
+        cat > /dev/null
+        (( strict )) && { pop; exit $?; }
+        exit 0 ;;
+    text-info)
+        (( has_filename )) || cat > /dev/null
+        if (( editable || strict )); then pop; exit $?; fi
+        exit 0 ;;
+    *)
+        pop; exit $? ;;
+esac

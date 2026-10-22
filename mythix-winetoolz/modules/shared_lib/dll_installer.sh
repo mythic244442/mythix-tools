@@ -3,27 +3,27 @@ set -euo pipefail
 
 # =============================================================================
 #  dll_installer.sh — Curated DLL Component Installer
-#  winetoolz v2.1
+#  winetoolz v3.0
 #
 #  Downloads DLLs from legitimate Microsoft / open-source sources,
 #  extracts them (cabextract / unzip / msiexec), places them into the
 #  prefix, and sets DLL overrides — same approach as winetricks.
+#  Every download is checked against the sha256 in ../downloads.tsv.
 #
 #  Sources used:
 #    • Microsoft Download Center  (direct CDN links)
-#    • DirectX Jun 2010 redist    (cabextract chain for d3dx* / dinput / xinput)
-#    • Mozilla fxc2 repo          (d3dcompiler_47 — MIT-licensed clean build)
-#    • openal.org                 (OpenAL SDK)
+#    • DirectX Jun 2010 redist    (cabextract chain for d3dx* / xinput)
+#    • Mozilla fxc2 repo          (d3dcompiler_47, pinned commit)
+#    • cnc-ddraw / dinputto8 / DxWnd redist (pinned releases)
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../winetoolz-lib.sh"
 
 MODULE="DLL Installer"
-CACHE_DIR="${HOME}/.cache/winetoolz/dll_installer"
-mkdir -p "$CACHE_DIR"
 
-wt_require_cmds zenity wget cabextract
+wt_require_cmds zenity cabextract
+_wt_have curl || _wt_have wget || wt_require_cmds curl
 
 # =============================================================================
 #  Component definitions
@@ -100,13 +100,13 @@ DLL_GROUP[msxml6]="XML / System"
 DLL_DESC[msxml6]="MS XML Core Services 6 SP2 — required by Office, many installers"
 
 # --- Media ---
-DLL_LABEL[quartz]="quartz (ffdshow)"
+DLL_LABEL[quartz]="quartz (game's own copy)"
 DLL_GROUP[quartz]="Media"
-DLL_DESC[quartz]="DirectShow quartz filter — improves video / cutscene playback"
+DLL_DESC[quartz]="Override only — lets a game that ships its own quartz.dll use it for videos"
 
-DLL_LABEL[devenum]="devenum"
+DLL_LABEL[devenum]="devenum (game's own copy)"
 DLL_GROUP[devenum]="Media"
-DLL_DESC[devenum]="Device enumerator — needed by DirectShow-based video/audio"
+DLL_DESC[devenum]="Override only — lets a game that ships its own devenum.dll use it"
 
 # --- Physics ---
 DLL_LABEL[physx]="PhysX Legacy (9.13)"
@@ -126,51 +126,11 @@ DLL_ORDER=(
 )
 
 # =============================================================================
-#  Download URLs
-# =============================================================================
-
-# DirectX Jun 2010 — used to extract d3dx9, d3dx10, d3dx11, xinput, d3dcompiler_43
-DIRECTX_2010_URL="https://download.microsoft.com/download/8/4/A/84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe"
-DIRECTX_2010_CACHE="$CACHE_DIR/directx_Jun2010_redist.exe"
-
-# d3drm — Direct3D Retained Mode (removed from Windows after XP).
-# d3drm was NEVER in the DX side-by-side cabs — it was a core OS component.
-# DxWnd (open-source SourceForge project) hosts the original Microsoft DLL for redistribution.
-URL_D3DRM="https://downloads.sourceforge.net/project/dxwnd/Redist/d3drm.dll"
-
-# d3dcompiler_47 — Mozilla fxc2 clean MIT-licensed build
-URL_D3DCOMP47_X86="https://raw.githubusercontent.com/mozilla/fxc2/master/dll/d3dcompiler_47_32.dll"
-URL_D3DCOMP47_X64="https://raw.githubusercontent.com/mozilla/fxc2/master/dll/d3dcompiler_47.dll"
-
-# msxml3 — Microsoft CDN
-URL_MSXML3="https://download.microsoft.com/download/8/8/8/888f34b7-4f54-4f06-8dac-fa29b19f33dd/msxml3.msi"
-
-# msxml6 — Microsoft CDN (KB2957482, SP2, includes 32+64)
-URL_MSXML6="https://download.microsoft.com/download/2/7/7/277681BE-4048-4A58-ABBA-259C465B1699/msxml6-KB2957482-enu-amd64.exe"
-
-# cnc-ddraw — open source, GitHub releases
-URL_CNC_DDRAW="https://github.com/FunkyFr3sh/cnc-ddraw/releases/download/v7.0.0.0/cnc-ddraw.zip"
-
-# dinputto8 — open source, GitHub releases
-URL_DINPUTTO8="https://github.com/elishacloud/dinputto8/releases/download/v1.0.92.0/dinput.dll"
-
-# PhysX 9.13 Legacy — the actual download is an MSI, not an exe.
-# Chocolatey's install script confirms this NVIDIA CDN URL is still live.
-# Must be installed with wine msiexec — running it directly causes ShellExecuteEx errors.
-URL_PHYSX="http://us.download.nvidia.com/Windows/9.13.0604/PhysX-9.13.0604-SystemSoftware-Legacy.msi"
-
-# =============================================================================
 #  1. Select Wine binary + prefix
 # =============================================================================
 
 wt_select_wine_bin "$MODULE" || exit 0
 wt_select_prefix_from_config "$MODULE" || exit 0
-
-IS_WIN64=false
-wt_is_win64 "$WINEPREFIX" && IS_WIN64=true
-
-SYS32="$WINEPREFIX/drive_c/windows/system32"
-SYSWOW64="$WINEPREFIX/drive_c/windows/syswow64"
 
 # =============================================================================
 #  2. Checklist
@@ -183,14 +143,17 @@ done
 
 SELECTED=$(zenity --list \
     --title="$(wt_title "$MODULE  ›  Select Components")" \
-    --text="<tt>Check each DLL component you want to install.\nDownloads are cached in  ~/.cache/winetoolz/dll_installer/</tt>" \
+    --text="$(_wt_box "$(printf 'Check each DLL component you want to install.\nDownloads are verified and cached in  %s' "$WT_DL_CACHE")")" \
     --checklist \
     --column="Install" --column="Key" --column="Group" --column="DLL / Component" --column="Description" \
     --hide-column=2 --print-column=2 \
     --width=1000 --height=580 \
     "${CHECKLIST_ARGS[@]}") || exit 0
 
-[[ -z "$SELECTED" ]] && wt_info "$MODULE" "No components selected — nothing to do." && exit 0
+if [[ -z "$SELECTED" ]]; then
+    wt_info "$MODULE" "No components selected — nothing to do."
+    exit 0
+fi
 
 IFS='|' read -ra CHOSEN_KEYS <<< "$SELECTED"
 
@@ -199,18 +162,7 @@ IFS='|' read -ra CHOSEN_KEYS <<< "$SELECTED"
 # =============================================================================
 
 export WT_INNER_WINE WT_WRAPPER WINEPREFIX
-export WT_LIB_PATH="$SCRIPT_DIR/../winetoolz-lib.sh"
-export WT_IS_WIN64="$IS_WIN64"
-export WT_SYS32="$SYS32"
-export WT_SYSWOW64="$SYSWOW64"
-export WT_CACHE="$CACHE_DIR"
 export WT_CHOSEN_KEYS="${CHOSEN_KEYS[*]}"
-
-export DIRECTX_2010_URL DIRECTX_2010_CACHE
-export URL_D3DRM
-export URL_D3DCOMP47_X86 URL_D3DCOMP47_X64
-export URL_MSXML3 URL_MSXML6
-export URL_CNC_DDRAW URL_DINPUTTO8 URL_PHYSX
 
 TMP=$(mktemp --suffix=.sh)
 trap 'rm -f "$TMP"' EXIT
@@ -224,53 +176,61 @@ export WINEPREFIX
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
-cd "$TMP_DIR"
+cd "$TMP_DIR" || exit 1
 
 read -ra KEYS <<< "$WT_CHOSEN_KEYS"
 
-SYS32="$WT_SYS32"
-SYSWOW64="$WT_SYSWOW64"
-IS_WIN64="$WT_IS_WIN64"
-CACHE="$WT_CACHE"
+# Where each architecture's DLLs belong in this prefix: 32-bit DLLs go to
+# syswow64 in a 64-bit prefix but to system32 in a 32-bit one.
+wt_prefix_dll_dirs "$WINEPREFIX"
+DIR32="$WT_DLLDIR_32"
+DIR64="$WT_DLLDIR_64"
 
 # ==========================================================================
 #  Helpers
 # ==========================================================================
 
-wt_dl() {
-    local url="$1" out="$2" label="${3:-$(basename "$out")}"
-    if [[ -f "$out" ]]; then
-        wt_log_info "  Cached:  $label"
+# fetch <catalog key> <label> — sets FETCHED (verified, cached download)
+fetch() {
+    FETCHED=""
+    wt_fetch_item "$1" "$2" || return 1
+    FETCHED="$WT_FETCHED"
+}
+
+# put <dll file> <dest dir> <dest name> — copy into the prefix (keeps Wine's
+# original as a backup, never writes through a Proton symlink)
+put() {
+    local src="$1" dir="$2" name="$3"
+    if [[ -z "$dir" ]]; then
+        wt_log_info "  (this prefix has no folder for that architecture — $name skipped)"
         return 0
     fi
-    wt_log "  Downloading $label..."
-    wget -q --show-progress -O "$out" "$url" \
-        && wt_log_ok "  Downloaded: $label" \
-        || { wt_log_err "  Download FAILED: $url"; return 1; }
+    if wt_dll_put "$src" "$dir" "$name"; then
+        wt_log_ok "  $name → $(basename "$dir")"
+        return 0
+    fi
+    return 1
 }
 
-# Copy a DLL into a system dir, removing symlinks first (wine uses them)
-install_dll() {
-    local src="$1" dst_dir="$2" name="${3:-$(basename "$src")}"
-    [[ -L "$dst_dir/$name" ]] && rm -f "$dst_dir/$name"
-    cp -f "$src" "$dst_dir/$name" \
-        && wt_log_ok "  [OK] $name → $(basename "$dst_dir")" \
-        || wt_log_err "  [FAIL] $name → $(basename "$dst_dir")"
+# override <dll> [mode]
+override() {
+    local mode="${2:-native,builtin}"
+    if wt_dll_override "$1" "$mode"; then
+        wt_log_ok "  override: $1 = $mode"
+        return 0
+    fi
+    wt_log_err "  override failed: $1"
+    return 1
 }
 
-# Set a DLL override in the registry
-set_override() {
-    local dll="$1" mode="${2:-native,builtin}"
-    "$WT_INNER_WINE" reg add \
-        'HKEY_CURRENT_USER\Software\Wine\DllOverrides' \
-        /v "$dll" /d "$mode" /f >/dev/null 2>&1 \
-        && wt_log_ok "  [OK] override: $dll = $mode" \
-        || wt_log_err "  [FAIL] override: $dll"
-}
-
-# Ensure the DirectX Jun 2010 package is cached (shared across d3dx* installs)
-ensure_directx_2010() {
-    wt_dl "$DIRECTX_2010_URL" "$DIRECTX_2010_CACHE" "DirectX Jun 2010 redist (~100MB)"
+# regsvr <dll name> <dir> — register a COM DLL with the matching regsvr32
+regsvr() {
+    local dll="$1" dir="$2"
+    [[ -n "$dir" && -f "$dir/regsvr32.exe" ]] || return 0
+    ( cd "$dir" && "$WT_INNER_WINE" "$dir/regsvr32.exe" /s "$dll" >/dev/null 2>&1 ) \
+        && wt_log_ok "  registered $dll" \
+        || wt_log_info "  $dll registration returned an error (often harmless)"
+    return 0
 }
 
 # Extract a specific DLL from a DirectX redist using the two-stage cabextract method.
@@ -278,183 +238,116 @@ ensure_directx_2010() {
 #   $1  dll_name   — e.g. d3dx9_43
 #   $2  arch       — x86 or x64
 #   $3  cab_glob   — optional: override cab search glob (default: *dll_name*arch*)
-#   $4  pkg_file   — optional: which redist exe to search (default: DIRECTX_2010_CACHE)
+#   $4  pkg_file   — optional: which redist exe to search (default: the Jun 2010 one)
 extract_from_directx() {
     local dll_name="$1"    # e.g. d3dx9_43
     local arch="$2"        # x86 or x64
-    local cab_glob="${3:-*${dll_name}*${arch}*}"   # optional override
-    local pkg_file="${4:-$DIRECTX_2010_CACHE}"     # optional: which redist to search
+    local cab_glob="${3:-*${1}*${2}*}"   # optional override
+    local pkg_file="${4:-$DX2010}"       # optional: which redist to search
 
     local cab_dir="$TMP_DIR/cab_${dll_name}_${arch}"
     mkdir -p "$cab_dir"
 
     # Stage 1: extract all cabs matching the glob from the redist
-    cabextract -q -d "$cab_dir" -L -F "$cab_glob" "$pkg_file" 2>/dev/null || true
+    cabextract -q -d "$cab_dir" -L -F "$cab_glob" -- "$pkg_file" >/dev/null 2>&1
 
     # Stage 2: loop ALL found cabs — some DLLs (e.g. xinput1_3) live in a later-dated
     # cab than the first match, so searching only head -1 silently misses them.
-    local dll_file=""
+    local dll_file="" cab_file try_dir
     while IFS= read -r -d '' cab_file; do
-        local try_dir="$TMP_DIR/dll_${dll_name}_${arch}_$(basename "$cab_file" .cab)"
+        try_dir="$TMP_DIR/dll_${dll_name}_${arch}_$(basename "$cab_file" .cab)"
         mkdir -p "$try_dir"
-        cabextract -q -d "$try_dir" -L "$cab_file" 2>/dev/null || true
-        dll_file="$(find "$try_dir" -iname "${dll_name}.dll" | head -1)"
+        cabextract -q -d "$try_dir" -L -F "${dll_name}.dll" -- "$cab_file" >/dev/null 2>&1
+        dll_file="$(find "$try_dir" -iname "${dll_name}.dll" -print -quit)"
         [[ -n "$dll_file" ]] && break
-    done < <(find "$cab_dir" -name '*.cab' -print0)
+    done < <(find "$cab_dir" -iname '*.cab' -print0 | sort -z)
 
-    if [[ -z "$dll_file" ]]; then
-        wt_log_err "  DLL not found in any cab for $dll_name ($arch)"
+    if [[ -z "$dll_file" ]] || ! wt_file_is "$dll_file" pe; then
+        wt_log_err "  $dll_name ($arch) is not in the DirectX package"
         return 1
     fi
 
     echo "$dll_file"
 }
 
+DX2010=""
+# Ensure the DirectX Jun 2010 package is cached (shared across d3dx* installs)
+ensure_directx_2010() {
+    [[ -n "$DX2010" ]] && return 0
+    fetch dx_jun2010 "DirectX Jun 2010 redist (~95 MB)" || return 1
+    DX2010="$FETCHED"
+}
+
+# dx_install <dll> [x86 cab glob] [x64 cab glob]
+#   One DLL from the DirectX redist: the 32-bit build where 32-bit DLLs go,
+#   the 64-bit build into system32 of a 64-bit prefix, then the override.
+dx_install() {
+    local dll="$1" g32="${2:-}" g64="${3:-}" f rc=0
+    ensure_directx_2010 || return 1
+    f="$(extract_from_directx "$dll" x86 ${g32:+"$g32"})" || return 1
+    put "$f" "$DIR32" "$dll.dll" || rc=1
+    if [[ -n "$DIR64" ]]; then
+        if f="$(extract_from_directx "$dll" x64 ${g64:+"$g64"})"; then
+            put "$f" "$DIR64" "$dll.dll" || rc=1
+        else
+            rc=1
+        fi
+    fi
+    override "$dll" || rc=1
+    return "$rc"
+}
+
+# dx_range <prefix> <from> <to> — e.g. d3dx9_ 24 43; fails if none installed
+dx_range() {
+    local stem="$1" from="$2" to="$3" n f done_=0 rc=0
+    ensure_directx_2010 || return 1
+    for n in $(seq "$from" "$to"); do
+        local dll="${stem}${n}"
+        f="$(extract_from_directx "$dll" x86 2>/dev/null)" || { wt_log_info "  $dll is not in the package — skipped"; continue; }
+        put "$f" "$DIR32" "$dll.dll" || { rc=1; continue; }
+        if [[ -n "$DIR64" ]] && f="$(extract_from_directx "$dll" x64 2>/dev/null)"; then
+            put "$f" "$DIR64" "$dll.dll" || rc=1
+        fi
+        override "$dll" || rc=1
+        done_=$((done_ + 1))
+    done
+    if (( done_ == 0 )); then
+        wt_log_err "  none of ${stem}${from}…${to} could be installed"
+        return 1
+    fi
+    wt_log_info "  $done_ DLL(s) installed"
+    return "$rc"
+}
+
 # ==========================================================================
 #  Install functions
 # ==========================================================================
 
-install_d3dx9_43() {
-    wt_section "d3dx9_43"
-    ensure_directx_2010 || return 1
+install_d3dx9_43()       { wt_section "d3dx9_43";                    dx_install d3dx9_43; }
+install_d3dx9_all()      { wt_section "d3dx9 (full set _24–_43)";    dx_range d3dx9_ 24 43; }
+install_d3dx10_43()      { wt_section "d3dx10_43";                   dx_install d3dx10_43; }
+install_d3dx10_all()     { wt_section "d3dx10 (full set _33–_43)";   dx_range d3dx10_ 33 43; }
+install_d3dx11_43()      { wt_section "d3dx11_43";                   dx_install d3dx11_43; }
+install_d3dx11_42()      { wt_section "d3dx11_42";                   dx_install d3dx11_42; }
+install_d3dcompiler_43() { wt_section "d3dcompiler_43";              dx_install d3dcompiler_43; }
 
-    local f32 f64
-    f32="$(extract_from_directx d3dx9_43 x86)" || return 1
-    install_dll "$f32" "$SYSWOW64"
-    set_override "d3dx9_43"
-
-    if [[ "$IS_WIN64" == "true" ]]; then
-        f64="$(extract_from_directx d3dx9_43 x64)" || true
-        [[ -n "$f64" ]] && install_dll "$f64" "$SYS32"
-    fi
-}
-
-install_d3dx9_all() {
-    wt_section "d3dx9 (full set _24–_43)"
-    ensure_directx_2010 || return 1
-
-    local n
-    for n in $(seq 24 43); do
-        local dll="d3dx9_${n}"
-        wt_log "  Processing $dll..."
-
-        local f32
-        f32="$(extract_from_directx "$dll" x86 2>/dev/null)" || { wt_log_info "  Skipping $dll x86 (not in package)"; continue; }
-        install_dll "$f32" "$SYSWOW64"
-
-        if [[ "$IS_WIN64" == "true" ]]; then
-            local f64
-            f64="$(extract_from_directx "$dll" x64 2>/dev/null)" || true
-            [[ -n "$f64" ]] && install_dll "$f64" "$SYS32"
-        fi
-
-        set_override "$dll"
-    done
-}
-
-install_d3dx10_43() {
-    wt_section "d3dx10_43"
-    ensure_directx_2010 || return 1
-
-    local f32
-    f32="$(extract_from_directx d3dx10_43 x86)" || return 1
-    install_dll "$f32" "$SYSWOW64"
-    set_override "d3dx10_43"
-
-    if [[ "$IS_WIN64" == "true" ]]; then
-        local f64
-        f64="$(extract_from_directx d3dx10_43 x64)" || true
-        [[ -n "$f64" ]] && install_dll "$f64" "$SYS32"
-    fi
-}
-
-install_d3dx10_all() {
-    wt_section "d3dx10 (full set _33–_43)"
-    ensure_directx_2010 || return 1
-
-    local n
-    for n in $(seq 33 43); do
-        local dll="d3dx10_${n}"
-        wt_log "  Processing $dll..."
-
-        local f32
-        f32="$(extract_from_directx "$dll" x86 2>/dev/null)" || { wt_log_info "  Skipping $dll (not in package)"; continue; }
-        install_dll "$f32" "$SYSWOW64"
-
-        if [[ "$IS_WIN64" == "true" ]]; then
-            local f64
-            f64="$(extract_from_directx "$dll" x64 2>/dev/null)" || true
-            [[ -n "$f64" ]] && install_dll "$f64" "$SYS32"
-        fi
-
-        set_override "$dll"
-    done
-}
-
-install_d3dx11_43() {
-    wt_section "d3dx11_43"
-    ensure_directx_2010 || return 1
-
-    local f32
-    f32="$(extract_from_directx d3dx11_43 x86)" || return 1
-    install_dll "$f32" "$SYSWOW64"
-    set_override "d3dx11_43"
-
-    if [[ "$IS_WIN64" == "true" ]]; then
-        local f64
-        f64="$(extract_from_directx d3dx11_43 x64)" || true
-        [[ -n "$f64" ]] && install_dll "$f64" "$SYS32"
-    fi
-}
-
-install_d3dx11_42() {
-    wt_section "d3dx11_42"
-    ensure_directx_2010 || return 1
-
-    local f32
-    f32="$(extract_from_directx d3dx11_42 x86)" || return 1
-    install_dll "$f32" "$SYSWOW64"
-    set_override "d3dx11_42"
-
-    if [[ "$IS_WIN64" == "true" ]]; then
-        local f64
-        f64="$(extract_from_directx d3dx11_42 x64)" || true
-        [[ -n "$f64" ]] && install_dll "$f64" "$SYS32"
-    fi
-}
-
-install_d3dcompiler_43() {
-    wt_section "d3dcompiler_43"
-    ensure_directx_2010 || return 1
-
-    local f32
-    f32="$(extract_from_directx d3dcompiler_43 x86)" || return 1
-    install_dll "$f32" "$SYSWOW64"
-    set_override "d3dcompiler_43"
-
-    if [[ "$IS_WIN64" == "true" ]]; then
-        local f64
-        f64="$(extract_from_directx d3dcompiler_43 x64)" || true
-        [[ -n "$f64" ]] && install_dll "$f64" "$SYS32"
-    fi
-}
+# XInput cabs in the DX2010 package are named Apr2007_xinput_x86.cab,
+# not *xinput1_3*x86* — so we must pass an explicit cab glob.
+install_xinput1_3()      { wt_section "xinput1_3";   dx_install xinput1_3   "*xinput*x86*" "*xinput*x64*"; }
+install_xinput9_1_0()    { wt_section "xinput9_1_0"; dx_install xinput9_1_0 "*xinput*x86*" "*xinput*x64*"; }
 
 install_d3dcompiler_47() {
     wt_section "d3dcompiler_47"
-    wt_log_info "Source: Mozilla fxc2 — MIT-licensed clean build"
-
-    local f32="$CACHE/d3dcompiler_47_32.dll"
-    local f64="$CACHE/d3dcompiler_47.dll"
-
-    wt_dl "$URL_D3DCOMP47_X86" "$f32" "d3dcompiler_47 (x86)" || return 1
-    wt_dl "$URL_D3DCOMP47_X64" "$f64" "d3dcompiler_47 (x64)" || return 1
-
-    install_dll "$f32" "$SYSWOW64" "d3dcompiler_47.dll"
-    set_override "d3dcompiler_47"
-
-    if [[ "$IS_WIN64" == "true" ]]; then
-        install_dll "$f64" "$SYS32" "d3dcompiler_47.dll"
+    wt_log_info "Source: Mozilla fxc2 (pinned commit, sha256-verified)"
+    local rc=0
+    fetch d3dcompiler_47_x86 "d3dcompiler_47 (x86)" || return 1
+    put "$FETCHED" "$DIR32" "d3dcompiler_47.dll" || rc=1
+    if [[ -n "$DIR64" ]]; then
+        fetch d3dcompiler_47_x64 "d3dcompiler_47 (x64)" || return 1
+        put "$FETCHED" "$DIR64" "d3dcompiler_47.dll" || rc=1
     fi
+    override "d3dcompiler_47" || rc=1
+    return "$rc"
 }
 
 install_d3drm() {
@@ -463,187 +356,145 @@ install_d3drm() {
     # It was NEVER distributed via the DirectX side-by-side cabs — those only contain
     # components like d3dx9/d3dx10/xinput that were added post-DX9.
     # DxWnd (open-source SourceForge project) hosts the original Microsoft DLL.
-    wt_log_info "Source: DxWnd SourceForge Redist (original Microsoft d3drm.dll)"
-
-    local dll_file="$CACHE/d3drm.dll"
-    wt_dl "$URL_D3DRM" "$dll_file" "d3drm.dll (~220KB)" || return 1
-
-    install_dll "$dll_file" "$SYSWOW64" "d3drm.dll"
-    set_override "d3drm"
+    wt_log_info "Source: DxWnd SourceForge Redist (original Microsoft d3drm.dll, sha256-verified)"
+    fetch d3drm "d3drm.dll" || return 1
+    put "$FETCHED" "$DIR32" "d3drm.dll" || return 1
+    override "d3drm"
 }
 
 install_ddraw() {
     wt_section "ddraw (cnc-ddraw)"
-    wt_log_info "Source: github.com/FunkyFr3sh/cnc-ddraw (open source)"
-    local pkg="$CACHE/cnc-ddraw.zip"
-    wt_dl "$URL_CNC_DDRAW" "$pkg" "cnc-ddraw.zip" || return 1
+    wt_log_info "Source: github.com/FunkyFr3sh/cnc-ddraw v7.0.0.0 (sha256-verified)"
+    fetch cnc_ddraw "cnc-ddraw.zip" || return 1
 
     local ext_dir="$TMP_DIR/cnc_ddraw"
-    mkdir -p "$ext_dir"
-    unzip -o -qq "$pkg" -d "$ext_dir"
-
+    if ! wt_extract "$FETCHED" "$ext_dir"; then
+        wt_log_err "  $WT_ARCHIVE_ERROR"
+        return 1
+    fi
     local dll_file
-    dll_file="$(find "$ext_dir" -iname 'ddraw.dll' | grep -i 'x86\|32' | head -1)"
-    [[ -z "$dll_file" ]] && dll_file="$(find "$ext_dir" -iname 'ddraw.dll' | head -1)"
-
+    dll_file="$(find "$ext_dir" -maxdepth 2 -iname 'ddraw.dll' -print -quit)"
     if [[ -z "$dll_file" ]]; then
         wt_log_err "  ddraw.dll not found in cnc-ddraw archive"
         return 1
     fi
-    install_dll "$dll_file" "$SYSWOW64" "ddraw.dll"
-    set_override "ddraw" "native,builtin"
-}
-
-install_xinput1_3() {
-    wt_section "xinput1_3"
-    ensure_directx_2010 || return 1
-
-    # XInput cabs in the DX2010 package are named Apr2007_xinput_x86.cab,
-    # not *xinput1_3*x86* — so we must pass an explicit cab glob.
-    local f32
-    f32="$(extract_from_directx xinput1_3 x86 "*xinput*x86*")" || return 1
-    install_dll "$f32" "$SYSWOW64"
-    set_override "xinput1_3"
-
-    if [[ "$IS_WIN64" == "true" ]]; then
-        local f64
-        f64="$(extract_from_directx xinput1_3 x64 "*xinput*x64*")" || true
-        [[ -n "$f64" ]] && install_dll "$f64" "$SYS32"
+    put "$dll_file" "$DIR32" "ddraw.dll" || return 1
+    # cnc-ddraw reads its settings from ddraw.ini next to the DLL; an
+    # existing (customised) one is kept.
+    local ini
+    ini="$(find "$ext_dir" -maxdepth 2 -iname 'ddraw.ini' -print -quit)"
+    if [[ -n "$ini" && -n "$DIR32" && ! -e "$DIR32/ddraw.ini" ]]; then
+        cp -- "$ini" "$DIR32/ddraw.ini" && wt_log_ok "  ddraw.ini → $(basename "$DIR32")"
     fi
-}
-
-install_xinput9_1_0() {
-    wt_section "xinput9_1_0"
-    ensure_directx_2010 || return 1
-
-    # Same cab-naming issue as xinput1_3 — glob must match Apr2007_xinput_x86.cab
-    local f32
-    f32="$(extract_from_directx xinput9_1_0 x86 "*xinput*x86*")" || return 1
-    install_dll "$f32" "$SYSWOW64"
-    set_override "xinput9_1_0"
-
-    if [[ "$IS_WIN64" == "true" ]]; then
-        local f64
-        f64="$(extract_from_directx xinput9_1_0 x64 "*xinput*x64*")" || true
-        [[ -n "$f64" ]] && install_dll "$f64" "$SYS32"
-    fi
+    override "ddraw" "native,builtin"
 }
 
 install_dinput() {
     wt_section "dinput (dinputto8)"
-    wt_log_info "Source: github.com/elishacloud/dinputto8 (open source)"
-    local dll_file="$CACHE/dinput_dinputto8.dll"
-    wt_dl "$URL_DINPUTTO8" "$dll_file" "dinputto8 dinput.dll" || return 1
-    install_dll "$dll_file" "$SYSWOW64" "dinput.dll"
-    set_override "dinput" "native,builtin"
+    wt_log_info "Source: github.com/elishacloud/dinputto8 v1.0.92.0 (sha256-verified)"
+    fetch dinputto8 "dinputto8 dinput.dll" || return 1
+    put "$FETCHED" "$DIR32" "dinput.dll" || return 1
+    override "dinput" "native,builtin"
 }
 
 install_msxml3() {
     wt_section "msxml3"
-    wt_log_info "Source: Microsoft Download Center"
-    local msi="$CACHE/msxml3.msi"
-    wt_dl "$URL_MSXML3" "$msi" "msxml3.msi" || return 1
+    wt_log_info "Source: msxml3.msi (CodeWeavers mirror, sha256-verified)"
+    fetch msxml3 "msxml3.msi" || return 1
 
     local ext_dir="$TMP_DIR/msxml3_ext"
     mkdir -p "$ext_dir"
-    cabextract -q -d "$ext_dir" "$msi" 2>/dev/null || true
+    cabextract -q -d "$ext_dir" -- "$FETCHED" >/dev/null 2>&1
 
     local dll_file
-    dll_file="$(find "$ext_dir" -iname 'msxml3.dll' | head -1)"
+    dll_file="$(find "$ext_dir" -iname 'msxml3.dll' -print -quit)"
     if [[ -z "$dll_file" ]]; then
         # Try wine msiexec as fallback
         wt_log_info "  Trying msiexec install..."
-        "$WT_INNER_WINE" msiexec /i "$msi" /quiet /norestart 2>/dev/null || true
-        set_override "msxml3" "native,builtin"
-        wt_log_info "  msxml3 installed via msiexec"
-        return 0
+        local rc=0
+        "$WT_INNER_WINE" msiexec /i "$FETCHED" /quiet /norestart >/dev/null 2>&1 || rc=$?
+        if (( rc != 0 && rc != 3010 && rc != 1641 )); then
+            wt_log_err "  msiexec failed (exit $rc)"
+            return 1
+        fi
+        override "msxml3" "native,builtin"
+        return
     fi
-    install_dll "$dll_file" "$SYSWOW64" "msxml3.dll"
-    set_override "msxml3" "native,builtin"
+    put "$dll_file" "$DIR32" "msxml3.dll" || return 1
+    override "msxml3" "native,builtin"
 }
 
 install_msxml6() {
     wt_section "msxml6"
-    wt_log_info "Source: Microsoft Download Center (KB2957482 SP2)"
-    local pkg="$CACHE/msxml6-KB2957482-enu-amd64.exe"
-    wt_dl "$URL_MSXML6" "$pkg" "msxml6-KB2957482-enu-amd64.exe (~1.8MB)" || return 1
+    wt_log_info "Source: Microsoft Download Center (KB2957482 SP2, sha256-verified)"
+    fetch msxml6 "msxml6-KB2957482-enu-amd64.exe (~1.8MB)" || return 1
 
     local ext1="$TMP_DIR/msxml6_stage1"
     local ext2_32="$TMP_DIR/msxml6_32"
     local ext2_64="$TMP_DIR/msxml6_64"
     mkdir -p "$ext1" "$ext2_32" "$ext2_64"
+    local rc=0 done_=0
 
     # Stage 1: extract outer exe
-    cabextract -q -d "$ext1" "$pkg" 2>/dev/null || true
+    cabextract -q -d "$ext1" -- "$FETCHED" >/dev/null 2>&1
 
     # Stage 2: extract 32-bit msi
-    local msi32
-    msi32="$(find "$ext1" -path '*/32/*' -iname 'msxml6.msi' | head -1)"
-    [[ -z "$msi32" ]] && msi32="$(find "$ext1" -iname 'msxml6.msi' | head -1)"
-
+    local msi32 dll32
+    msi32="$(find "$ext1" -path '*/32/*' -iname 'msxml6.msi' -print -quit)"
+    [[ -z "$msi32" ]] && msi32="$(find "$ext1" -iname 'msxml6.msi' -print -quit)"
     if [[ -n "$msi32" ]]; then
-        cabextract -q -d "$ext2_32" "$msi32" 2>/dev/null || true
-        local dll32
-        dll32="$(find "$ext2_32" -iname 'msxml6.dll*' | head -1)"
-        if [[ -n "$dll32" ]]; then
-            install_dll "$dll32" "$SYSWOW64" "msxml6.dll"
-        fi
+        cabextract -q -d "$ext2_32" -- "$msi32" >/dev/null 2>&1
+        dll32="$(find "$ext2_32" -iname 'msxml6.dll*' -print -quit)"
+        if [[ -n "$dll32" ]]; then put "$dll32" "$DIR32" "msxml6.dll" && done_=1 || rc=1; fi
     fi
 
     # Stage 2: extract 64-bit msi (if win64 prefix)
-    if [[ "$IS_WIN64" == "true" ]]; then
-        local msi64
-        msi64="$(find "$ext1" -path '*/64/*' -iname 'msxml6.msi' | head -1)"
+    if [[ -n "$DIR64" ]]; then
+        local msi64 dll64
+        msi64="$(find "$ext1" -path '*/64/*' -iname 'msxml6.msi' -print -quit)"
         if [[ -n "$msi64" ]]; then
-            cabextract -q -d "$ext2_64" "$msi64" 2>/dev/null || true
-            local dll64
-            dll64="$(find "$ext2_64" -iname 'msxml6.dll*' | head -1)"
-            if [[ -n "$dll64" ]]; then
-                install_dll "$dll64" "$SYS32" "msxml6.dll"
-            fi
+            cabextract -q -d "$ext2_64" -- "$msi64" >/dev/null 2>&1
+            dll64="$(find "$ext2_64" -iname 'msxml6.dll*' -print -quit)"
+            if [[ -n "$dll64" ]]; then put "$dll64" "$DIR64" "msxml6.dll" && done_=1 || rc=1; fi
         fi
     fi
 
-    set_override "msxml6" "native,builtin"
+    if (( ! done_ )); then
+        wt_log_err "  msxml6.dll not found in the package"
+        return 1
+    fi
+    override "msxml6" "native,builtin" || rc=1
+    return "$rc"
 }
 
 install_quartz() {
     wt_section "quartz"
     wt_log_info "Setting quartz DLL override to native,builtin..."
-    set_override "quartz" "native,builtin"
-    wt_log_info "Note: native quartz requires ffdshow or other DirectShow filters installed."
+    wt_log_info "Wine then uses a quartz.dll the game ships next to its .exe (and its own otherwise)."
+    override "quartz" "native,builtin"
 }
 
 install_devenum() {
     wt_section "devenum"
     wt_log_info "Setting devenum DLL override to native,builtin..."
-    set_override "devenum" "native,builtin"
+    wt_log_info "Wine then uses a devenum.dll the game ships next to its .exe (and its own otherwise)."
+    override "devenum" "native,builtin"
 }
 
 install_physx() {
     wt_section "PhysX Legacy (9.13.0604)"
     wt_log_info "Source: NVIDIA CDN (official MSI package)"
     # The file is an MSI — use a distinct cache name so stale .exe downloads are not reused.
-    local pkg="$CACHE/PhysX-9.13.0604-SystemSoftware-Legacy.msi"
-    wt_dl "$URL_PHYSX" "$pkg" "PhysX-9.13.0604-SystemSoftware-Legacy.msi (~19MB)" || return 1
-
-    # Validate the download is actually an MSI / PE, not an HTML error page
-    local magic
-    magic="$(file "$pkg" 2>/dev/null || true)"
-    if ! echo "$magic" | grep -qi 'MSI\|Composite Document\|CDFV2'; then
-        wt_log_err "  Downloaded file does not appear to be a valid MSI."
-        wt_log_err "  Delete the cached file and retry: $pkg"
-        return 1
-    fi
+    fetch physx_legacy "PhysX-9.13.0604-SystemSoftware-Legacy.msi (~19MB)" || return 1
 
     wt_log "  Running PhysX MSI installer via msiexec..."
-    "$WT_INNER_WINE" msiexec /i "$pkg" /quiet /norestart 2>/dev/null
-    local rc=$?
-    if [[ $rc -eq 0 ]]; then
-        wt_log_ok "  PhysX installed."
-    else
-        wt_log_err "  msiexec exited with code $rc (may still have installed — exit 3010 = reboot required, also means success)."
-    fi
+    local rc=0
+    "$WT_INNER_WINE" msiexec /i "$FETCHED" /quiet /norestart >/dev/null 2>&1 || rc=$?
+    case "$rc" in
+        0)         wt_log_ok "  PhysX installed." ;;
+        3010|1641) wt_log_ok "  PhysX installed (Windows would want a reboot — not needed under Wine)." ;;
+        *)         wt_log_err "  msiexec exited with code $rc."; return 1 ;;
+    esac
 }
 
 # ==========================================================================
@@ -652,8 +503,8 @@ install_physx() {
 
 wt_section "DLL Installer"
 wt_log_info "Wine   : $WT_INNER_WINE"
-wt_log_info "Prefix : $WINEPREFIX"
-wt_log_info "Cache  : $WT_CACHE"
+wt_log_info "Prefix : $WINEPREFIX  ($(wt_prefix_arch "$WINEPREFIX"))"
+wt_log_info "Cache  : $WT_DL_CACHE"
 wt_log_info "Queue  : ${KEYS[*]}"
 printf '\n'
 
@@ -680,11 +531,18 @@ wt_log_info "Succeeded : ${SUCCEEDED[*]:-(none)}"
 wt_log_info "Failed    : ${FAILED[*]:-(none)}"
 wt_log_info "Prefix    : $WINEPREFIX"
 wt_log_info ""
-wt_log_info "Downloads cached at: $WT_CACHE"
-wt_log_info "(Safe to delete to free space, will re-download as needed)"
+wt_log_info "Downloads cached at: $WT_DL_CACHE"
+wt_log_info "(verified on every use — safe to delete to free space)"
 
-read -rp "  Press Enter to close..." < /dev/tty
+wt_pause
+(( ${#FAILED[@]} == 0 ))
 INNEREOF
 
 chmod +x "$TMP"
 wt_run_in_terminal "$TMP"
+
+if [[ "$WT_TERMINAL_RC" == 0 ]]; then
+    wt_ok "$MODULE" "Installing ${CHOSEN_KEYS[*]}"
+else
+    wt_warn "$MODULE" "$(printf 'Some components did not install — the terminal summary\nlists which ones and why.\n\n  Prefix : %s' "$WINEPREFIX")"
+fi

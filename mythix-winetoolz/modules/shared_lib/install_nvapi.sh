@@ -2,167 +2,113 @@
 set -euo pipefail
 
 # =============================================================================
-#  install_nvapi.sh — DXVK-NVAPI Installer
-#  winetoolz v2.0
-#  Installs DXVK-NVAPI DLLs + layer into a Wine prefix.
+#  install_nvapi.sh — DXVK-NVAPI Installer / Uninstaller
+#  winetoolz v3.0
+#  Installs or removes DXVK-NVAPI (nvapi, nvapi64, nvofapi64) in a Wine prefix,
+#  plus its optional Vulkan Reflex layer files.
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../winetoolz-lib.sh"
 
 MODULE="DXVK-NVAPI Installer"
+DLLS_64=(nvapi64 nvofapi64)
+DLLS_32=(nvapi)
+PROFILE_DIR="${HOME}/.config/winetoolz/env_profiles"
 
 wt_require_cmds zenity
 
 # =============================================================================
-#  1. Select Wine / Proton binary
+#  1. Choose action
+# =============================================================================
+
+ACTION=$(zenity --list \
+    --title="$(wt_title "$MODULE")" \
+    --text="<tt>Choose an action to perform on the selected prefix.</tt>" \
+    --radiolist \
+    --column="" --column="Action" --column="Description" \
+    TRUE  "install"   "Copy DXVK-NVAPI DLLs into prefix and set DLL overrides" \
+    FALSE "uninstall" "Remove DXVK-NVAPI and its overrides" \
+    --width="$WT_WIDTH" --height=220) || exit 0
+ACTION="${ACTION%%|*}"
+[[ "$ACTION" == install || "$ACTION" == uninstall ]] || exit 0
+
+# =============================================================================
+#  2. Select Wine / Proton binary
 # =============================================================================
 
 wt_select_wine_bin "$MODULE" || exit 0
 
 # =============================================================================
-#  2. Select WINEPREFIX
+#  3. Select WINEPREFIX
 # =============================================================================
 
-wt_select_prefix "$MODULE" || exit 0
+wt_select_prefix_from_config "$MODULE" || exit 0
+wt_warn_managed_prefix "$MODULE" "DXVK-NVAPI" || exit 0
+
+LAYER_DEST="$WINEPREFIX/dxvk-nvapi-layer"
 
 # =============================================================================
-#  3. Ensure DXVK-NVAPI release is present (auto-download if needed)
+#  4. Ensure DXVK-NVAPI release is present (auto-download if needed)
 # =============================================================================
 
-wt_ensure_release \
-    "dxvk-nvapi" \
-    "jp7677/dxvk-nvapi" \
-    "dxvk-nvapi-v[0-9]" || exit 0
+SRC64="" SRC32="" LAYER_DIR=""
+if [[ "$ACTION" == "install" ]]; then
+    wt_ensure_release \
+        "dxvk-nvapi" \
+        "jp7677/dxvk-nvapi" \
+        "^dxvk-nvapi-v[0-9]" || exit 0
+    DLL_ROOT="$WT_DLL_ROOT"
 
-DLL_ROOT="$WT_DLL_ROOT"
-
-# --- Auto-detect 64-bit dir ---
-NVAPI_LIB64=""
-if   [[ -d "$DLL_ROOT/x64" ]];   then NVAPI_LIB64="$DLL_ROOT/x64"
-elif [[ -d "$DLL_ROOT/bin64" ]]; then NVAPI_LIB64="$DLL_ROOT/bin64"
-fi
-
-[[ -n "$NVAPI_LIB64" ]] || wt_error "$(printf 'Could not find a 64-bit NVAPI DLL directory under:\n  %s\n\nExpected a subfolder named  x64  or  bin64.' "$DLL_ROOT")"
-
-# --- Auto-detect 32-bit dir (optional) ---
-NVAPI_LIB32=""
-if   [[ -d "$DLL_ROOT/x86" ]];   then NVAPI_LIB32="$DLL_ROOT/x86"
-elif [[ -d "$DLL_ROOT/x32" ]];   then NVAPI_LIB32="$DLL_ROOT/x32"
-elif [[ -d "$DLL_ROOT/32bit" ]]; then NVAPI_LIB32="$DLL_ROOT/32bit"
-fi
-
-# --- Auto-detect Vulkan layer dir ---
-LAYER_DIR=""
-if   [[ -d "$DLL_ROOT/layer" ]];       then LAYER_DIR="$DLL_ROOT/layer"
-elif [[ -d "$DLL_ROOT/nvapi-layer" ]]; then LAYER_DIR="$DLL_ROOT/nvapi-layer"
-fi
-
-[[ -n "$LAYER_DIR" ]] || wt_error "$(printf 'Could not find an NVAPI layer directory under:\n  %s\n\nExpected a subfolder named  layer  or  nvapi-layer.\n\nThis release may not include a Vulkan layer.\nCheck the contents of:\n  %s' "$DLL_ROOT" "$DLL_ROOT")"
-
-# =============================================================================
-#  4. Generate + run helper script in terminal
-# =============================================================================
-
-TMP=$(mktemp --suffix=.sh)
-trap 'rm -f "$TMP"' EXIT
-
-cat <<EOF > "$TMP"
-#!/usr/bin/env bash
-set +e
-source "$(printf '%s' "$SCRIPT_DIR/../winetoolz-lib.sh")"
-
-export WINEPREFIX="$WINEPREFIX"
-export WINEDEBUG=-all
-export WINEDLLOVERRIDES="mscoree,mshtml="
-
-INNER_WINE="$WT_INNER_WINE"
-WRAPPER="$WT_WRAPPER"
-NVAPI_LIB64="$NVAPI_LIB64"
-NVAPI_LIB32="$NVAPI_LIB32"
-LAYER_DIR="$LAYER_DIR"
-
-wt_section "DXVK-NVAPI  ›  install"
-wt_log_info "Prefix  : \$WINEPREFIX"
-wt_log_info "Wine    : \$INNER_WINE"
-wt_log_info "Wrapper : \${WRAPPER:-none}"
-wt_log_info "x64 dir : \$NVAPI_LIB64"
-wt_log_info "x32 dir : \${NVAPI_LIB32:-none}"
-wt_log_info "Layer   : \$LAYER_DIR"
-printf '\n'
-
-wt_log "Initialising prefix..."
-"\$INNER_WINE" wineboot -u && wt_log_ok "wineboot done." || wt_log_err "wineboot reported an error (may be harmless)."
-
-WIN64_SYS=\$("\$INNER_WINE" winepath -u 'C:\\windows\\system32' 2>/dev/null)
-WIN64_SYS=\${WIN64_SYS%$'\r'}
-WIN32_SYS=\$("\$INNER_WINE" winepath -u 'C:\\windows\\syswow64' 2>/dev/null)
-WIN32_SYS=\${WIN32_SYS%$'\r'}
-
-if [[ -z "\$WIN64_SYS" ]]; then
-    wt_log_err "Failed to resolve C:\\windows\\system32 — aborting."
-    read -rp "Press Enter to close..." < /dev/tty
-    exit 1
-fi
-
-WOW64=false
-if [[ -n "\$WIN32_SYS" && -d "\$WINEPREFIX/drive_c/windows/syswow64" ]]; then
-    WOW64=true
-    wt_log_info "64-bit prefix — will also install 32-bit DLLs into syswow64."
-else
-    wt_log_info "32-bit or pure 64-bit prefix — skipping syswow64 DLLs."
-fi
-
-# --- Install all DLLs from a directory ---
-install_dir() {
-    local dst_dir="\$1"
-    local src_dir="\$2"
-    local label="\$3"
-
-    [[ -d "\$dst_dir" ]] || { wt_log_err "Destination missing: \$dst_dir"; return 1; }
-    [[ -d "\$src_dir" ]] || { wt_log_err "Source missing: \$src_dir";      return 1; }
-
-    for dll in "\$src_dir"/*.dll; do
-        [[ -f "\$dll" ]] || continue
-        local name
-        name=\$(basename "\$dll")
-        cp "\$dll" "\$dst_dir/"
-        wt_log_ok "\$name  →  \$label"
+    for d in x64 bin64; do
+        if [[ -d "$DLL_ROOT/$d" ]]; then SRC64="$DLL_ROOT/$d"; break; fi
     done
-}
-
-wt_section "Installing NVAPI DLLs..."
-
-install_dir "\$WIN64_SYS" "\$NVAPI_LIB64" "system32"
-
-if \$WOW64 && [[ -n "\$NVAPI_LIB32" ]]; then
-    install_dir "\$WIN32_SYS" "\$NVAPI_LIB32" "syswow64"
+    for d in x32 x86 32bit; do
+        if [[ -d "$DLL_ROOT/$d" ]]; then SRC32="$DLL_ROOT/$d"; break; fi
+    done
+    if [[ -z "$SRC64" ]]; then
+        wt_error "$(printf 'Could not find a 64-bit NVAPI DLL directory under:\n  %s\n\nExpected a subfolder named  x64  or  bin64.' "$DLL_ROOT")"
+    fi
+    # The Vulkan Reflex layer only ships with newer releases — optional.
+    for d in layer nvapi-layer; do
+        if [[ -d "$DLL_ROOT/$d" ]]; then LAYER_DIR="$DLL_ROOT/$d"; break; fi
+    done
 fi
 
-wt_section "Installing Vulkan Layer..."
+# =============================================================================
+#  5. Install / uninstall in a terminal
+# =============================================================================
 
-LAYER_DEST="\$WINEPREFIX/dxvk-nvapi-layer"
-mkdir -p "\$LAYER_DEST"
-cp -r "\$LAYER_DIR/"* "\$LAYER_DEST/"
-wt_log_ok "Layer files copied to: \$LAYER_DEST"
+export WT_LAYER_NAME="DXVK-NVAPI" WT_LAYER_ACTION="$ACTION" \
+       WT_LAYER_DLLS64="${DLLS_64[*]}" WT_LAYER_DLLS32="${DLLS_32[*]}" \
+       WT_LAYER_SRC64="$SRC64" WT_LAYER_SRC32="$SRC32"
+wt_dll_layer_run "$MODULE" || exit 0
 
-wt_section "Applying DLL Overrides..."
+# =============================================================================
+#  6. Reflex layer files and the launch variable DXVK needs
+# =============================================================================
 
-REG_FILE=\$(mktemp --suffix=.reg)
-cat <<REGEOF > "\$REG_FILE"
-REGEDIT4
+if [[ "$ACTION" == "uninstall" ]]; then
+    if [[ -d "$LAYER_DEST" ]]; then
+        rm -rf -- "$LAYER_DEST"
+    fi
+    exit 0
+fi
 
-[HKEY_CURRENT_USER\\Software\\Wine\\DllOverrides]
-"nvapi"="native,builtin"
-"nvapi64"="native,builtin"
-REGEOF
+LAYER_NOTE=""
+if [[ -n "$LAYER_DIR" ]]; then
+    mkdir -p "$LAYER_DEST"
+    cp -r -- "$LAYER_DIR/." "$LAYER_DEST/"
+    LAYER_NOTE="$(printf '\n\nThe Vulkan Reflex layer files were copied to:\n  %s\n(see the DXVK-NVAPI README for enabling Reflex)' "$LAYER_DEST")"
+fi
 
-"\$INNER_WINE" regedit "\$REG_FILE" && wt_log_ok "DLL overrides applied." || wt_log_err "regedit returned an error."
-rm -f "\$REG_FILE"
-
-wt_section "DXVK-NVAPI installation complete."
-read -rp "  Press Enter to close..." < /dev/tty
-EOF
-
-chmod +x "$TMP"
-wt_run_in_terminal "$TMP"
+# DXVK reports NVIDIA GPUs as AMD unless DXVK_ENABLE_NVAPI=1 is set, which
+# makes NVAPI (DLSS, Reflex) invisible to games. Offer an Env Flags profile.
+PROFILE_FILE="$PROFILE_DIR/dxvk-nvapi.env"
+if [[ -f "$PROFILE_FILE" ]]; then
+    wt_info "$MODULE" "$(printf 'Launch games with the  dxvk-nvapi  env profile\n(App Launcher › Env Profile) so DXVK exposes NVAPI:\n\n  DXVK_ENABLE_NVAPI=1%s' "$LAYER_NOTE")"
+elif wt_confirm "$MODULE  ›  Launch Variable" "$(printf 'DXVK only exposes NVAPI (DLSS, Reflex) to games when\nthey are started with:\n\n  DXVK_ENABLE_NVAPI=1\n\nCreate the env profile  dxvk-nvapi  with it, for the\nApp Launcher and Log Viewer?%s' "$LAYER_NOTE")"; then
+    mkdir -p "$PROFILE_DIR"
+    printf '# winetoolz env profile: dxvk-nvapi\nexport DXVK_ENABLE_NVAPI="1"\n' > "$PROFILE_FILE"
+    wt_info "$MODULE" "$(printf '✔  Env profile saved:  dxvk-nvapi\n\n  %s' "$PROFILE_FILE")"
+fi

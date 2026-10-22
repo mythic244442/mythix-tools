@@ -3,11 +3,15 @@ set -euo pipefail
 
 # =============================================================================
 #  wine_toolz.sh — Main Launcher
-#  winetoolz v2.1
+#  winetoolz v3.0
 #
 #  Top-level menu shows categories.
 #  Selecting a category opens a looping submenu of its modules.
 #  Back / cancel returns to the category menu.
+#
+#    wine_toolz.sh              the menus
+#    wine_toolz.sh <module>     run one module directly (see --list)
+#    wine_toolz.sh --list | --version | --help
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,37 +33,55 @@ done
 
 LIB="${_WT_LIB_ROOT}/modules/winetoolz-lib.sh"
 if [[ ! -f "$LIB" ]]; then
-    zenity --error --text="Cannot find winetoolz-lib.sh.\nExpected at: $LIB" 2>/dev/null \
-        || echo "FATAL: winetoolz-lib.sh not found at: $LIB"
+    echo "FATAL: winetoolz-lib.sh not found at: $LIB" >&2
+    zenity --error --no-markup --text="Cannot find winetoolz-lib.sh.
+Expected at: $LIB" 2>/dev/null || true
     exit 1
 fi
+# shellcheck source=modules/winetoolz-lib.sh
 source "$LIB"
 wt_load_config
 
 # =============================================================================
 #  Terminal banner  (shown in the launching terminal while zenity menus run)
 # =============================================================================
+show_banner() {
 printf '\e[1;35m'
-cat <<'WOLF'
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⠁⠸⢳⡄⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⠃⠀⠀⢸⠸⠀⡠⣄⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡠⠃⠀⠀⢠⣞⣀⡿⠀⠀⣧⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣠⡖⠁⠀⠀⠀⢸⠈⢈⡇⠀⢀⡏⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⡴⠩⢠⡴⠀⠀⠀⠀⠀⠈⡶⠉⠀⠀⡸⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⢀⠎⢠⣇⠏⠀⠀⠀⠀⠀⠀⠀⠁⠀⢀⠄⡇⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⢠⠏⠀⢸⣿⣴⠀⠀⠀⠀⠀⠀⣆⣀⢾⢟⠴⡇⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⢀⣿⠀⠠⣄⠸⢹⣦⠀⠀⡄⠀⠀⢋⡟⠀⠀⠁⣇⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⢀⡾⠁⢠⠀⣿⠃⠘⢹⣦⢠⣼⠀⠀⠉⠀⠀⠀⠀⢸⡀⠀⠀⠀⠀
-⠀⠀⢀⣴⠫⠤⣶⣿⢀⡏⠀⠀⠘⢸⡟⠋⠀⠀⠀⠀⠀⠀⠀⠀⢳⠀⠀⠀⠀
-⠐⠿⢿⣿⣤⣴⣿⣣⢾⡄⠀⠀⠀⠀⠳⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢣⠀⠀⠀
-⠀⠀⠀⣨⣟⡍⠉⠚⠹⣇⡄⠀⠀⠀⠀⠀⠀⠀⠀⠈⢦⠀⠀⢀⡀⣾⡇⠀⠀
-⠀⠀⢠⠟⣹⣧⠃⠀⠀⢿⢻⡀⢄⠀⠀⠀⠀⠐⣦⡀⣸⣆⠀⣾⣧⣯⢻⠀⠀
-⠀⠀⠘⣰⣿⣿⡄⡆⠀⠀⠀⠳⣼⢦⡘⣄⠀⠀⡟⡷⠃⠘⢶⣿⡎⠻⣆⠀⠀
-⠀⠀⠀⡟⡿⢿⡿⠀⠀⠀⠀⠀⠙⠀⠻⢯⢷⣼⠁⠁⠀⠀⠀⠙⢿⡄⡈⢆⠀
-⠀⠀⠀⠀⡇⣿⡅⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⠦⠀⠀⠀⠀⠀⠀⡇⢹⢿⡀
-⠀⠀⠀⠀⠁⠛⠓⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠼⠇⠁
-WOLF
+cat <<'BANNER'
+                     ____________________
+                _____   ..            .  _____
+             ///.         .     .+            \\\
+           //              |\     /\            .\\\
+         //  .     .       |#\\  /##\               \\
+       //.      +   .     |####_/#/##|  .             \
+      (       .   .+     /###::##//###|     .     +.  .))
+    (( +. .   +       /////:::########|   .   .  ..      )
+   (   .          .///################|    .   .     +    )
+   (      . ..    |/############\######\\               . )
+  ( .     .   ___//:\\<o<#####\::\#####\\_\   .++          )
+  (      ____/###############:##\\\\###\\#\|   ..          )
+  ( ..   |################::#:\\#\:\#####\#\\   .           )
+  (       \\#############:\\:\\\\\\:###:\\#\|      ..       )
+  ( .       \'''''''#######///\\\\\#\:\\\##:#|         ..   )
+  (                 |#######:#######\\########|      .     )
+  (                 |:/#/::/:#:##\::##########\|       +   )
+   (        .      |////////://##/########:\#:#|     +*   )
+   (  .            |:/#///////:/:##########\\:##\ .       )
+    ((        .    |/#/://///:##################\| +.    )
+      (+      .    \/////#/:/::#####\#########\::\\    ))
+       \           |/:#####/////////########::\\###|  /
+        \\   +     |:########//:/#########\\:##:\#\<//
+          \\\     |/#:/:##################/###/##///
+             \\\   |##//\####################////
+                ----|###/:################----
+                    ----------------------
+          __  ____     _______ _    _ _______   __
+         |  \/  \ \   / /__   __| |  | |_   _\ \ / /
+         | \  / |\ \_/ /   | |  | |__| | | |  \ V /
+         | |\/| | \   /    | |  |  __  | | |   > <
+         | |  | |  | |     | |  | |  | |_| |_ / . \
+         |_|  |_|  |_|     |_|  |_|  |_|_____/_/ \_\
+BANNER
 printf '\n'
 printf '  ╔══════════════════════════════════════════════════════════════╗\n'
 printf '  ║                                                              ║\n'
@@ -69,12 +91,15 @@ printf '  ║                                                              ║\n
 printf '  ╚══════════════════════════════════════════════════════════════╝\n'
 printf '\e[0m\n'
 printf '  \e[2mZenity menus running — this terminal stays open as the host.\e[0m\n\n'
+}
 
 # =============================================================================
 #  Script paths
 # =============================================================================
 
 MOD="${_WT_LIB_ROOT}/modules/shared_lib"
+WINECFG_SCRIPT="$MOD/winecfg.sh"
+RUNTIME_MGR_SCRIPT="$MOD/runtime_manager.sh"
 DXVK_SETUP_SCRIPT="$MOD/dxvk_setup-gui.sh"
 VKD3D_SETUP_SCRIPT="$MOD/setup_vkd3d_proton-gui.sh"
 NVAPI_SETUP_SCRIPT="$MOD/install_nvapi.sh"
@@ -94,8 +119,6 @@ LOG_VIEWER_SCRIPT="$MOD/log_viewer.sh"
 ABOUT_SCRIPT="$MOD/about.sh"
 WINE_INSTALL_MGR_SCRIPT="$MOD/wine_install_manager.sh"
 
-wt_require_cmds zenity
-
 # =============================================================================
 #  Helper: run a module script
 # =============================================================================
@@ -105,11 +128,13 @@ run_module() {
     local script="$1"; shift
     local args=("$@")
 
-    if [[ ! -x "$script" ]]; then
-        wt_error_return "$(printf 'Module not found or not executable:\n  %s' "$script")"
+    if [[ ! -r "$script" ]]; then
+        wt_error_return "$(printf 'Module not found:\n  %s' "$script")"
         return 1
     fi
-    "$script" "${args[@]}" || true
+    printf '\e[1m›\e[0m %s\n' "$label"
+    # Through bash, so a checkout that lost its executable bits still works.
+    bash "$script" "${args[@]}" || true
 }
 
 # =============================================================================
@@ -167,42 +192,19 @@ _dispatch_module() {
         # Runtimes
         opt_runtimes) run_module "Runtime Libraries"       "$RUNTIMES_SCRIPT"                ;;
         opt_dx10)     run_module "DirectX Jun 2010"        "$DIRECTX_2010_SCRIPT"            ;;
+        opt_vc)       run_module "VC++ Runtime Installer"  "$VC_RUNTIME_SCRIPT"              ;;
 
         # Wine
         opt_winetools)  run_module "Wine Tools"             "$WINE_TOOLS_SCRIPT"              ;;
         opt_dll)        run_module "DLL Override Manager"   "$DLL_OVERRIDE_SCRIPT"            ;;
         opt_winemgr)    run_module "Wine Install Manager"   "$WINE_INSTALL_MGR_SCRIPT"        ;;
+        opt_rtmgr)      run_module "Runtime Downloads"      "$RUNTIME_MGR_SCRIPT"             ;;
 
         # Prefix
         opt_prefix)   run_module "Prefix Creator"          "$PREFIX_CREATOR_SCRIPT"          ;;
         opt_pfxmgr)   run_module "Prefix Manager"          "$PREFIX_MANAGER_SCRIPT"          ;;
         opt_pfxdiag)  run_module "Prefix Diagnostics"      "$PREFIX_DIAG_SCRIPT"             ;;
-        opt_cfg)
-            wt_select_prefix "Winecfg" || return
-            wt_select_wine_bin "Winecfg" || return
-            export WT_INNER_WINE WINEPREFIX WT_WRAPPER
-            export WT_LIB_PATH="$SCRIPT_DIR/modules/winetoolz-lib.sh"
-            local TMP
-            TMP=$(mktemp --suffix=.sh)
-            cat <<'INNEREOF' > "$TMP"
-#!/usr/bin/env bash
-set +e
-source "$WT_LIB_PATH"
-export WINEPREFIX
-wt_section "winecfg"
-wt_log_info "Wine   : $WT_INNER_WINE"
-wt_log_info "Prefix : $WINEPREFIX"
-printf '\n'
-if [[ -n "$WT_WRAPPER" ]]; then
-    "$WT_WRAPPER" run winecfg
-else
-    "$WT_INNER_WINE" winecfg
-fi
-read -rp "  Press Enter to close..." < /dev/tty
-INNEREOF
-            chmod +x "$TMP"
-            wt_run_in_terminal "$TMP"
-            ;;
+        opt_cfg)      run_module "Winecfg"                 "$WINECFG_SCRIPT"                 ;;
 
         # Launch
         opt_launch)  run_module "App Launcher"             "$APP_LAUNCHER_SCRIPT"            ;;
@@ -226,6 +228,48 @@ INNEREOF
 #  plus a list of module triples passed to show_submenu.
 # =============================================================================
 
+# =============================================================================
+#  Command line
+# =============================================================================
+
+# Short names for running one module directly: wine_toolz.sh <name>
+declare -A CLI_TAG=(
+    [dxvk]=opt_dxvk [vkd3d]=opt_vkd3d [nvapi]=opt_nvapi
+    [runtimes]=opt_runtimes [vcredist]=opt_vc [directx]=opt_dx10
+    [winetools]=opt_winetools [overrides]=opt_dll [wine-manager]=opt_winemgr [downloads]=opt_rtmgr
+    [create-prefix]=opt_prefix [winecfg]=opt_cfg [prefix-manager]=opt_pfxmgr [diagnostics]=opt_pfxdiag
+    [launcher]=opt_launch [env]=opt_env [logs]=opt_log
+    [dlls]=opt_dll_inst [components]=opt_sys [about]=opt_about
+)
+
+case "${1:-}" in
+    -h|--help)
+        printf 'winetoolz %s — a Zenity GUI toolkit for Wine / Proton prefixes\n\n' "$WT_VERSION"
+        printf 'Usage:\n  %s              open the menus\n  %s <module>     run one module directly\n  %s --list       list the module names\n  %s --version\n' \
+            "$0" "$0" "$0" "$0"
+        exit 0 ;;
+    -V|--version)
+        printf 'winetoolz %s\n' "$WT_VERSION"
+        exit 0 ;;
+    -l|--list)
+        printf '%s\n' "${!CLI_TAG[@]}" | sort
+        exit 0 ;;
+esac
+
+wt_require_cmds zenity
+trap 'printf "\nwinetoolz: interrupted.\n"; exit 130' INT
+
+if [[ -n "${1:-}" ]]; then
+    if [[ -z "${CLI_TAG[$1]:-}" ]]; then
+        printf 'winetoolz: no module named "%s" — see  %s --list\n' "$1" "$0" >&2
+        exit 2
+    fi
+    _dispatch_module "${CLI_TAG[$1]}"
+    exit 0
+fi
+
+show_banner
+
 # Top-level category menu
 while true; do
     CAT=$(zenity --list \
@@ -236,7 +280,7 @@ while true; do
         --width=620 --height=420 \
         "cat_graphics"    "🎮  Graphics"       "DXVK, VKD3D-Proton, DXVK-NVAPI" \
         "cat_runtimes"    "📦  Runtimes"       ".NET, VC++, XNA, DirectX, OpenAL, and more" \
-        "cat_wine"        "🍷  Wine"           "Wine tools, DLL override manager" \
+        "cat_wine"        "🍷  Wine"           "Wine tools, DLL overrides, Wine builds and downloads" \
         "cat_prefix"      "📁  Prefix"         "Create, manage, backup, restore, diagnose prefixes" \
         "cat_launch"      "🚀  Launch"         "App launcher, env flags, log viewer" \
         "cat_components"  "🔧  Components"     "DLL installer, system file installer"  \
@@ -261,6 +305,7 @@ while true; do
         cat_runtimes)
             show_submenu "Runtimes" \
                 "opt_runtimes" "Runtime Libraries"         ".NET / XNA / XACT / VC++ / DirectPlay / OpenAL and more" \
+                "opt_vc"       "Visual C++ 2015+ (quick)"  "Just the latest Visual C++ redistributables" \
                 "opt_dx10"     "Install DirectX Jun 2010"  "Legacy DirectX offline redistributable package"
             ;;
 
@@ -268,7 +313,8 @@ while true; do
             show_submenu "Wine" \
                 "opt_winetools" "Wine Tools"           "Uninstaller, control, taskmgr, regedit, explorer, wineboot" \
                 "opt_dll"       "DLL Override Manager" "View, apply presets, add custom, remove DLL overrides" \
-                "opt_winemgr"   "Wine Install Manager" "Install, switch, uninstall, and manage custom Wine builds"
+                "opt_winemgr"   "Wine Install Manager" "Install, switch, uninstall, and manage custom Wine builds" \
+                "opt_rtmgr"     "Runtime Downloads"    "Download GE-Proton and Kron4ek Wine builds (verified)"
             ;;
 
         cat_prefix)

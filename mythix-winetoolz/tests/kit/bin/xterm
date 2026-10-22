@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Mock terminal emulator for the winetoolz tests: runs the command after -e
+# right here, synchronously, with no tty, so "open in a terminal" steps (the
+# inner scripts wt_run_in_terminal launches) execute inside the test. What
+# they print goes to $KIT_TERM_LOG (wt_kit_terminal_log) — the runner sends
+# the terminal's own stdout to /dev/null, like a real window would.
+printf 'TERMINAL' >> "${ZMOCK_LOG:-/dev/null}"
+printf ' %q' "$@" >> "${ZMOCK_LOG:-/dev/null}"
+printf '\n' >> "${ZMOCK_LOG:-/dev/null}"
+while (( $# )) && [[ "$1" != "-e" ]]; do shift; done
+shift
+exec "$@" </dev/null >>"${KIT_TERM_LOG:-/dev/null}" 2>&1

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 #  about.sh — About / Help / Dependency Checker
-#  winetoolz v2.1
+#  winetoolz v3.0
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,6 +12,7 @@ source "$SCRIPT_DIR/../winetoolz-lib.sh"
 MODULE="About winetoolz"
 
 wt_require_cmds zenity
+wt_load_config
 
 # =============================================================================
 #  Dependency definitions
@@ -23,20 +24,35 @@ declare -A DEP_PKG DEP_USED_BY
 DEP_PKG[zenity]="zenity"
 DEP_USED_BY[zenity]="All modules (required)"
 
-DEP_PKG[wget]="wget"
-DEP_USED_BY[wget]="Runtimes Installer, VC++ Installer"
-
 DEP_PKG[curl]="curl"
-DEP_USED_BY[curl]="DXVK / VKD3D downloader"
+DEP_USED_BY[curl]="All downloads (or wget)"
+
+DEP_PKG[wget]="wget"
+DEP_USED_BY[wget]="Downloads when curl is missing (optional)"
 
 DEP_PKG[cabextract]="cabextract"
-DEP_USED_BY[cabextract]="DirectX Jun 2010 Installer"
+DEP_USED_BY[cabextract]="DLL Installer, DirectX, XACT, DirectPlay, System File Installer"
+
+DEP_PKG[7z]="p7zip / 7zip"
+DEP_USED_BY[7z]="System File Installer (.7z, .rar, some .exe)"
+
+DEP_PKG[xz]="xz-utils"
+DEP_USED_BY[xz]="Kron4ek Wine builds, VKD3D-Proton releases"
 
 DEP_PKG[unzip]="unzip"
 DEP_USED_BY[unzip]="OpenAL installer, Runtimes"
 
 DEP_PKG[zstd]="zstd"
 DEP_USED_BY[zstd]="VKD3D-Proton extraction, Prefix backup/restore"
+
+DEP_PKG[python3]="python3"
+DEP_USED_BY[python3]="Quoted launch arguments, GitHub releases, Mythix game names (optional)"
+
+DEP_PKG[jq]="jq"
+DEP_USED_BY[jq]="GitHub release lookups (optional, python3 works too)"
+
+DEP_PKG[flock]="util-linux"
+DEP_USED_BY[flock]="Noticing a closed terminal window (optional)"
 
 DEP_PKG[tar]="tar"
 DEP_USED_BY[tar]="DXVK / VKD3D extraction, Prefix backup"
@@ -46,6 +62,9 @@ DEP_USED_BY[wrestool]="App Launcher icon extraction (optional)"
 
 DEP_PKG[icotool]="icoutils"
 DEP_USED_BY[icotool]="App Launcher icon extraction (optional)"
+
+DEP_PKG[wl-copy]="wl-clipboard"
+DEP_USED_BY[wl-copy]="Env Flags clipboard export on Wayland (optional)"
 
 DEP_PKG[xclip]="xclip"
 DEP_USED_BY[xclip]="Env Flags clipboard export (optional)"
@@ -59,7 +78,7 @@ DEP_USED_BY[vulkaninfo]="Vulkan diagnostics (optional)"
 DEP_PKG[wine]="wine / wine64"
 DEP_USED_BY[wine]="System Wine fallback (optional if using custom builds)"
 
-DEP_ORDER=(zenity wget curl cabextract unzip zstd tar wrestool icotool xclip xsel vulkaninfo wine)
+DEP_ORDER=(zenity curl wget cabextract 7z unzip xz zstd tar python3 jq flock wrestool icotool wl-copy xclip xsel vulkaninfo wine)
 
 # =============================================================================
 #  Module listing
@@ -72,16 +91,19 @@ MODULES_INFO="$(cat << 'MODEOF'
     DXVK-NVAPI Installer   — NVIDIA API layer for DLSS / NvAPI
 
   [ Runtimes ]
-    VC++ Runtime Installer — Visual C++ 2015–2022 / 2017–2026
+    Runtime Libraries      — .NET / XNA / XACT / DirectPlay / OpenAL / VC++
+    VC++ Runtime Installer — Visual C++ 2015–2022 / 2017–2026 (quick)
     DirectX Jun 2010       — Legacy DirectX offline redistributable
-    Runtime Libraries      — .NET / XNA / XACT / DirectPlay / OpenAL / VC++ legacy
 
   [ Wine ]
-    Wine Tools             — Uninstaller, control panel, taskmgr, regedit, explorer
-    DLL Override Manager   — View, add presets, add custom, remove DLL overrides
+    Wine Tools             — Uninstaller, control panel, regedit, cmd, drive C:
+    DLL Override Manager   — Overrides for all programs or one, with presets
+    Wine Install Manager   — Install, switch, uninstall custom Wine builds
+    Runtime Downloads      — GE-Proton and Kron4ek Wine builds from GitHub
 
   [ Prefix ]
     Create Prefix          — Bootstrap a new Wine prefix
+    Winecfg                — Wine configuration for an existing prefix
     Prefix Manager         — Backup, restore, regedit, kill, build manager
     Prefix Diagnostics     — Health check, arch, Windows ver, DXVK, disk usage
 
@@ -91,7 +113,8 @@ MODULES_INFO="$(cat << 'MODEOF'
     Log Viewer             — Capture and view Wine output logs
 
   [ Components ]
-    System File Installer  — Copy system DLLs into a prefix
+    DLL Installer          — Curated DLLs: d3dx9/10/11, d3dcompiler, xinput, msxml…
+    System File Installer  — Install the DLLs from any archive into a prefix
 
   [ System ]
     About / Help           — This screen
@@ -113,6 +136,7 @@ while true; do
         "modules"  "Module Reference"     "List all modules and what they do" \
         "config"   "Config File Location" "Show where winetoolz stores its config and data" \
         "exit"     "Close"                "") || break
+    CHOICE="${CHOICE%%|*}"
 
     case "$CHOICE" in
 
@@ -120,15 +144,14 @@ while true; do
         deps)
             # Run checks
             ROWS=()
+            PM="$(_wt_pkg_manager)"
             for cmd in "${DEP_ORDER[@]}"; do
-                local status icon
                 if command -v "$cmd" >/dev/null 2>&1; then
-                    local ver
-                    ver="$("$cmd" --version 2>/dev/null | head -1 | sed 's/^[^0-9]*//' | cut -c1-30 || echo "")"
+                    ver="$(timeout 5 "$cmd" --version </dev/null 2>/dev/null | head -1 | sed 's/^[^0-9]*//' | cut -c1-30 || echo "")"
                     status="✔  installed${ver:+  ($ver)}"
                     icon="✔"
                 else
-                    status="✘  not found  —  install: ${DEP_PKG[$cmd]}"
+                    status="✘  not found  —  $(_wt_install_hint "$PM" "$(_wt_pkg_for "$cmd" "$PM")")"
                     icon="✘"
                 fi
                 ROWS+=("$icon" "$cmd" "${DEP_PKG[$cmd]}" "${DEP_USED_BY[$cmd]}" "$status")
@@ -152,18 +175,28 @@ while true; do
         config)
             wt_info "$MODULE  ›  Config & Data Locations" "$(printf \
 'Config file       :  %s
+Prefix search     :  %s
 Launcher shortcuts:  %s
 Env profiles      :  %s
 Icon cache        :  %s
 Prefix backups    :  %s
 Wine logs         :  %s
+Download cache    :  %s
+DXVK/VKD3D/NVAPI  :  %s
+Wine builds       :  %s
+Managed installs  :  %s
 winetoolz root    :  %s' \
-                "${HOME}/winetoolz/.config" \
+                "$WT_CONFIG_FILE" \
+                "${WT_PREFIX_PATHS//:/  }" \
                 "${HOME}/.config/winetoolz/launchers/" \
                 "${HOME}/.config/winetoolz/env_profiles/" \
                 "${HOME}/.config/winetoolz/icons/" \
-                "${HOME}/winetoolz/backups/" \
+                "$WT_BACKUP_DIR" \
                 "${HOME}/winetoolz/logs/" \
+                "$WT_DL_CACHE" \
+                "$WT_RELEASE_BASE" \
+                "${HOME}/wine-custom/buildz" \
+                "${HOME}/.local/share/mythix-wine-installs" \
                 "$(dirname "$SCRIPT_DIR")")"
             ;;
 
