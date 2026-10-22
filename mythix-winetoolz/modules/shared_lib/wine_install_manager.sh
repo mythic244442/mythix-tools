@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 #  wine_install_manager.sh — Wine Install Manager
-#  winetoolz v2.1
+#  winetoolz v3.0
 #  Install, list, switch, uninstall, and inspect custom Wine builds.
 #  Managed installs live in ~/.local/share/mythix-wine-installs/<name>/
 # =============================================================================
@@ -73,45 +73,81 @@ installed=$(date '+%Y-%m-%d %H:%M')
 EOF
 }
 
+BINS=(wine wineserver wine64 wineboot winecfg msiexec notepad regedit regsvr32)
+
 # _set_active <install_name>
-#   Points ~/.local/bin/wine, wineserver, wine64, wineboot, winecfg → install
+#   Points ~/.local/bin/wine, wineserver, wine64, wineboot, winecfg … at an
+#   install. Only links winetoolz made (into the managed installs) are
+#   replaced; anything else there — your own wrapper script, a link to
+#   /opt/wine-staging — is left alone unless you agree to set it aside as
+#   <name>.wt-backup. Sets WIM_MADE / WIM_KEPT for the report.
 _set_active() {
     local name="$1"
-    local dir="$INSTALL_BASE/$name"
+    local dir="$INSTALL_BASE/$name" b link target
+    local -a foreign=()
+    WIM_MADE=() WIM_KEPT=()
+    mkdir -p "$SYMLINK_DIR"
 
-    local bins=(wine wineserver wine64 wineboot winecfg msiexec notepad regedit regsvr32)
-    for b in "${bins[@]}"; do
-        # Remove existing symlink if it points into our managed installs
-        if [[ -L "$SYMLINK_DIR/$b" ]]; then
-            local target
-            target="$(readlink -f "$SYMLINK_DIR/$b" 2>/dev/null || true)"
-            if [[ "$target" == "$INSTALL_BASE"/* ]] || [[ "$target" == "$dir"/* ]]; then
-                rm -f "$SYMLINK_DIR/$b"
+    for b in "${BINS[@]}"; do
+        [[ -x "$dir/bin/$b" ]] || continue
+        link="$SYMLINK_DIR/$b"
+        if [[ -L "$link" ]]; then
+            target="$(readlink -f "$link" 2>/dev/null || true)"
+            if [[ -e "$link" && "$target" != "$INSTALL_BASE"/* ]]; then
+                foreign+=("$b")
+                continue
             fi
+        elif [[ -e "$link" ]]; then
+            foreign+=("$b")
+            continue
         fi
-        # Create new symlink if the binary exists
-        if [[ -x "$dir/bin/$b" ]]; then
-            ln -sf "$dir/bin/$b" "$SYMLINK_DIR/$b"
-        fi
+        rm -f -- "$link"
+        ln -s -- "$dir/bin/$b" "$link" && WIM_MADE+=("$b")
     done
+
+    if (( ${#foreign[@]} )); then
+        if wt_confirm "$MODULE  >  Replace Your Files?" "$(printf 'These are already in  %s  and were not made by winetoolz:\n\n  %s\n\nSet them aside (renamed to <name>.wt-backup) and link\n%s instead?  Choose No to leave them as they are.' \
+            "$SYMLINK_DIR" "${foreign[*]}" "$name")"; then
+            for b in "${foreign[@]}"; do
+                link="$SYMLINK_DIR/$b"
+                local backup="$link.wt-backup"
+                [[ -e "$backup" || -L "$backup" ]] && backup="$link.wt-backup.$(date +%Y%m%d%H%M%S)"
+                mv -- "$link" "$backup" && ln -s -- "$dir/bin/$b" "$link" && WIM_MADE+=("$b")
+            done
+        else
+            WIM_KEPT=("${foreign[@]}")
+        fi
+    fi
 }
 
 # _clear_active <install_name>
 #   Removes symlinks that point to the given install
 _clear_active() {
     local name="$1"
-    local dir="$INSTALL_BASE/$name"
+    local dir="$INSTALL_BASE/$name" b target
 
-    local bins=(wine wineserver wine64 wineboot winecfg msiexec notepad regedit regsvr32)
-    for b in "${bins[@]}"; do
+    for b in "${BINS[@]}"; do
         if [[ -L "$SYMLINK_DIR/$b" ]]; then
-            local target
             target="$(readlink -f "$SYMLINK_DIR/$b" 2>/dev/null || true)"
-            if [[ "$target" == "$dir"/* ]] || [[ "$target" == "$INSTALL_BASE/$name"/* ]]; then
-                rm -f "$SYMLINK_DIR/$b"
+            if [[ "$target" == "$dir"/* ]]; then
+                rm -f -- "$SYMLINK_DIR/$b"
             fi
         fi
     done
+}
+
+# _active_report — the dialog text after a switch
+_active_report() {
+    local name="$1" text
+    text="$(printf 'Active Wine:  %s\n\nLinked in %s:\n  %s' "$name" "$SYMLINK_DIR" "${WIM_MADE[*]:-(nothing)}")"
+    if (( ${#WIM_KEPT[@]} )); then
+        text+="$(printf '\n\nLeft as they were (yours):\n  %s' "${WIM_KEPT[*]}")"
+    fi
+    case ":$PATH:" in
+        *":$SYMLINK_DIR:"*) ;;
+        *) text+="$(printf '\n\n⚠  %s is not on your PATH yet — log out and back in,\n   or add it in ~/.profile, for "wine" to pick this build.' "$SYMLINK_DIR")" ;;
+    esac
+    printf '%s' "$text"
 }
 
 # =============================================================================
@@ -201,11 +237,12 @@ Expected bin/wine or bin/wine64 inside:
     esac
 
     [[ -n "$source_path" ]] || return 0
+    source_path="${source_path%/}"
 
     # --- Pick install name ---
     local default_name=""
     if [[ "$src_type" == "tarball" ]]; then
-        default_name="$(basename "$source_path" | sed 's/\.tar\.\(gz\|xz\|zst\|bz2\)$//')"
+        default_name="$(basename "$source_path" | sed 's/\.\(tar\.\(gz\|xz\|zst\|bz2\)\|tgz\)$//')"
     else
         default_name="$(basename "$source_path")"
     fi
@@ -213,146 +250,132 @@ Expected bin/wine or bin/wine64 inside:
     local install_name
     install_name=$(zenity --entry \
         --title="$(wt_title "$MODULE  >  Install Name")" \
-        --text="$(printf '<tt>Choose a name for this Wine installation.\n\nIt will be installed to:\n  %s/&lt;name&gt;/\n\nUse something short and descriptive\n(e.g. wine-10.5-staging, wine-tkg-custom).</tt>' "$INSTALL_BASE")" \
+        --text="$(_wt_box "$(printf 'Choose a name for this Wine installation.\n\nIt will be installed to:\n  %s/<name>/\n\nUse something short and descriptive\n(e.g. wine-10.5-staging, wine-tkg-custom).' "$INSTALL_BASE")")" \
         --entry-text="$default_name" \
         --width="$WT_WIDTH") || return 0
 
-    # Sanitise name
+    # Sanitise name: no path tricks, no hidden or option-looking names
     install_name="${install_name//[^a-zA-Z0-9._-]/_}"
+    install_name="${install_name#"${install_name%%[!.-]*}"}"
 
     if [[ -z "$install_name" ]]; then
-        wt_error_return "Install name cannot be empty."
+        wt_error_return "Please enter a name made of letters, digits, dots, dashes or underscores."
         return 0
     fi
 
     local dest="$INSTALL_BASE/$install_name"
 
+    # The source may not be (or be inside) the install it would replace.
+    local src_real dest_real
+    src_real="$(realpath -m -- "$source_path")"
+    dest_real="$(realpath -m -- "$dest")"
+    if [[ "$src_real" == "$dest_real" || "$src_real" == "$dest_real"/* || "$dest_real" == "$src_real"/* ]]; then
+        wt_error_return "$(printf 'The source is the install itself:\n  %s\n\nPick a different name or source.' "$source_path")"
+        return 0
+    fi
+
     if [[ -d "$dest" ]]; then
         wt_confirm "$MODULE  >  Overwrite?" \
-            "$(printf 'An install named  %s  already exists.\n\nOverwrite it?' "$install_name")" || return 0
-        _clear_active "$install_name"
-        rm -rf "$dest"
+            "$(printf 'An install named  %s  already exists.\n\nReplace it? The current one is kept until the new\nbuild has been installed and checked.' "$install_name")" || return 0
     fi
 
     # --- Actually install (in terminal for progress) ---
+    # Everything reaches the script through the environment, never pasted
+    # into its text: a file or folder name is only ever data.
+    export WIM_TYPE="$src_type" WIM_SOURCE="$source_path" WIM_DEST="$dest" \
+           WIM_BASE="$INSTALL_BASE" WIM_NAME="$install_name" WIM_DESC="$source_desc" \
+           WIM_META="$META_FILE"
+
     local TMP
     TMP=$(mktemp --suffix=.sh)
-    trap 'rm -f "$TMP"' RETURN
 
-    cat > "$TMP" <<SCRIPT
+    cat > "$TMP" <<'SCRIPT'
 #!/usr/bin/env bash
 set +e
-source "$SCRIPT_DIR/../winetoolz-lib.sh"
+source "$WT_LIB_PATH"
 
 wt_section "Wine Install Manager  >  Installing"
-wt_log_info "Source : $source_path"
-wt_log_info "Dest   : $dest"
-wt_log_info "Type   : $src_type"
+wt_log_info "Source : $WIM_SOURCE"
+wt_log_info "Dest   : $WIM_DEST"
+wt_log_info "Type   : $WIM_TYPE"
 printf '\n'
 
-mkdir -p "$dest"
+fail() { wt_log_err "$*"; [[ -n "${STAGE:-}" ]] && rm -rf -- "$STAGE"; wt_pause; exit 1; }
 
-case "$src_type" in
+# Install into a staging folder next to the destination; the current install
+# (if any) is only replaced once the new one checks out.
+STAGE="$(mktemp -d "$WIM_BASE/.staging.XXXXXX")" || fail "Cannot write to $WIM_BASE"
+BUILD="$STAGE/build"
+
+case "$WIM_TYPE" in
     builder|directory)
         wt_log "Copying Wine build..."
+        mkdir -p "$BUILD"
         if command -v rsync &>/dev/null; then
-            rsync -aH --info=progress2 "$source_path/" "$dest/"
+            rsync -aH --info=progress2 "$WIM_SOURCE/" "$BUILD/" || fail "Copy failed."
         else
-            cp -a "$source_path/." "$dest/"
+            cp -a "$WIM_SOURCE/." "$BUILD/" || fail "Copy failed."
         fi
         ;;
     tarball)
         wt_log "Extracting archive..."
-        _tar_log="\$(mktemp)"
-        _tar_ok=false
-
-        _try_extract() {
-            # Try with --strip-components=1 first (tarballs with a top-level dir),
-            # fall back to plain extraction if that fails.
-            if tar "\$@" "$source_path" -C "$dest" --strip-components=1 2>"\$_tar_log"; then
-                _tar_ok=true
-            elif tar "\$@" "$source_path" -C "$dest" 2>"\$_tar_log"; then
-                _tar_ok=true
-            fi
-        }
-
-        case "$source_path" in
-            *.tar.zst)
-                if ! command -v zstd &>/dev/null; then
-                    wt_log_err "zstd is required for .tar.zst archives."
-                    wt_log_err "Install it:  sudo apt install zstd"
-                    read -rp "  Press Enter to close..." < /dev/tty
-                    exit 1
-                fi
-                _try_extract --use-compress-program=zstd -xf
-                ;;
-            *.tar.xz)  _try_extract -xJf ;;
-            *.tar.bz2) _try_extract -xjf ;;
-            *)         _try_extract -xzf ;;
+        case "$WIM_SOURCE" in
+            *.tar.zst) command -v zstd &>/dev/null || fail "zstd is required for .tar.zst archives — install the zstd package." ;;
         esac
-
-        if ! \$_tar_ok; then
-            wt_log_err "Failed to extract archive:"
-            cat "\$_tar_log" >&2
-            rm -f "\$_tar_log"
-            read -rp "  Press Enter to close..." < /dev/tty
-            exit 1
-        fi
-        rm -f "\$_tar_log"
+        # Wine builds ship symlinks of their own; one top-level folder in the
+        # archive is unwrapped, a flat archive is taken as it is.
+        wt_extract_tree "$WIM_SOURCE" "$BUILD" --allow-links || fail "Failed to extract archive: $WT_ARCHIVE_ERROR"
         ;;
 esac
 
 # Fix permissions and ensure binaries are executable
-chmod -R u+w,a+rX "$dest"
-[[ -d "$dest/bin" ]] && chmod +x "$dest/bin"/* 2>/dev/null || true
-chown -R "\$(id -u):\$(id -g)" "$dest" 2>/dev/null || true
+chmod -R u+w,a+rX "$BUILD"
+[[ -d "$BUILD/bin" ]] && chmod +x "$BUILD/bin"/* 2>/dev/null
 
 # Validate
-if [[ ! -x "$dest/bin/wine" && ! -x "$dest/bin/wine64" ]]; then
-    wt_log_err "Installation failed — no wine binary found in $dest/bin/"
-    wt_log_err "The archive may have an unexpected structure."
-    if [[ -d "$dest/bin" ]]; then
-        wt_log_err "Contents of bin/:"
-        ls -la "$dest/bin/" 2>/dev/null || true
-    else
-        wt_log_err "No bin/ directory found. Top-level contents:"
-        ls -la "$dest/" 2>/dev/null || true
-    fi
-    read -rp "  Press Enter to close..." < /dev/tty
-    exit 1
+if [[ ! -x "$BUILD/bin/wine" && ! -x "$BUILD/bin/wine64" ]]; then
+    wt_log_err "No wine binary found in the new build's bin/ — the archive may have an unexpected structure."
+    if [[ -d "$BUILD/bin" ]]; then ls -la "$BUILD/bin/" 2>/dev/null; else ls -la "$BUILD/" 2>/dev/null; fi
+    fail "Nothing was installed or changed."
 fi
+WINE="$BUILD/bin/wine"; [[ -x "$WINE" ]] || WINE="$BUILD/bin/wine64"
+version="$("$WINE" --version 2>/dev/null | head -1)"
+[[ -n "$version" ]] || version="unknown"
 
-wt_log_ok "Wine build installed to: $dest"
+# Swap it into place
+if [[ -e "$WIM_DEST" ]]; then
+    mv -- "$WIM_DEST" "$STAGE/previous" || fail "Could not move the current install aside."
+fi
+if ! mv -- "$BUILD" "$WIM_DEST"; then
+    [[ -e "$STAGE/previous" ]] && mv -- "$STAGE/previous" "$WIM_DEST"
+    fail "Could not move the new build into place; the previous install was kept."
+fi
+rm -rf -- "$STAGE"
+STAGE=""
 
-# Write metadata
-version="unknown"
-[[ -x "$dest/bin/wine" ]] && version="\$("$dest/bin/wine" --version 2>/dev/null | head -1 || echo "unknown")"
-cat > "$dest/$META_FILE" <<META
-name=$install_name
-version=\$version
-source=$source_desc
-installed=\$(date '+%Y-%m-%d %H:%M')
-META
+printf 'name=%s\nversion=%s\nsource=%s\ninstalled=%s\n' \
+    "$WIM_NAME" "$version" "$WIM_DESC" "$(date '+%Y-%m-%d %H:%M')" > "$WIM_DEST/$WIM_META"
 
-wt_log_ok "Metadata written."
-
-# Offer to set as active
-printf '\n'
-wt_log_info "Version: \$version"
-wt_log_info "Location: $dest"
-
+wt_log_ok "Wine build installed to: $WIM_DEST"
+wt_log_info "Version: $version"
 wt_section "Done!"
-read -rp "  Press Enter to close..." < /dev/tty
+wt_pause
 SCRIPT
     chmod +x "$TMP"
     wt_run_in_terminal "$TMP"
+    rm -f "$TMP"
 
     # After install, offer to set as active
-    if [[ -d "$dest" && ( -x "$dest/bin/wine" || -x "$dest/bin/wine64" ) ]]; then
-        _write_meta "$dest" "$source_desc"
-        wt_confirm "$MODULE  >  Set Active?" \
-            "$(printf 'Set  %s  as the active Wine?\n\nThis will create symlinks in:\n  %s\n\nSo that running \"wine\" uses this build.' "$install_name" "$SYMLINK_DIR")" \
-            && _set_active "$install_name"
+    if [[ "$WT_TERMINAL_RC" == 0 && -d "$dest" && ( -x "$dest/bin/wine" || -x "$dest/bin/wine64" ) ]]; then
+        if wt_confirm "$MODULE  >  Set Active?" \
+            "$(printf 'Set  %s  as the active Wine?\n\nThis will create symlinks in:\n  %s\n\nSo that running "wine" uses this build.' "$install_name" "$SYMLINK_DIR")"; then
+            _set_active "$install_name"
+            wt_ok "$MODULE" "$(_active_report "$install_name")"$'\n\n'"Switching"
+        else
+            wt_ok "$MODULE" "Installing $install_name"
+        fi
+    else
+        wt_error_return "$(printf 'The install did not complete — see the terminal output.\n\n  %s' "$dest")"
     fi
 }
 
@@ -382,7 +405,7 @@ Use  Install  to add a Wine build."
 
     zenity --list \
         --title="$(wt_title "$MODULE  >  Installed Builds")" \
-        --text="<tt>Managed Wine installations in:\n  $INSTALL_BASE</tt>" \
+        --text="$(_wt_box "$(printf 'Managed Wine installations in:\n  %s' "$INSTALL_BASE")")" \
         --column="Name" --column="Version" --column="Installed" --column="Active" \
         --width=720 --height=380 \
         "${rows[@]}" || true
@@ -417,7 +440,7 @@ _do_switch() {
     local chosen
     chosen=$(zenity --list \
         --title="$(wt_title "$MODULE  >  Switch Active Wine")" \
-        --text="<tt>Select which Wine build to set as the default.\nSymlinks in  $SYMLINK_DIR  will be updated.</tt>" \
+        --text="$(_wt_box "$(printf 'Select which Wine build to set as the default.\nSymlinks in  %s  will be updated.' "$SYMLINK_DIR")")" \
         --radiolist \
         --column="" --column="Name" --column="Version" --column="Installed" --column="Active" \
         --width=720 --height=380 \
@@ -425,8 +448,9 @@ _do_switch() {
 
     [[ -n "$chosen" ]] || return 0
 
+    chosen="${chosen%%|*}"
     _set_active "$chosen"
-    wt_ok "$MODULE" "$(printf 'Switched active Wine to:  %s\n\nSymlinks updated in:\n  %s' "$chosen" "$SYMLINK_DIR")"
+    wt_info "$MODULE" "$(_active_report "$chosen")"
 }
 
 # =============================================================================
@@ -472,15 +496,20 @@ _do_uninstall() {
     wt_confirm "$MODULE  >  Confirm Uninstall" \
         "$(printf 'The following Wine builds will be permanently removed:\n\n%b\nThis cannot be undone. Continue?' "$names_list")" || return 0
 
+    local failed=""
     for sel in "${selections[@]}"; do
         local dir="$INSTALL_BASE/$sel"
         if [[ -d "$dir" ]]; then
             _clear_active "$sel"
-            rm -rf "$dir"
+            wt_safe_rmrf "$dir" bin/wine bin/wine64 "$META_FILE" || failed+="  $sel: $WT_RMRF_ERROR\n"
         fi
     done
 
-    wt_ok "$MODULE" "$(printf 'Uninstalled %d Wine build(s).\n\nRemoved:\n%b' "${#selections[@]}" "$names_list")"
+    if [[ -n "$failed" ]]; then
+        wt_error_return "$(printf 'Some builds could not be removed:\n\n%b' "$failed")"
+        return 0
+    fi
+    wt_ok "$MODULE" "$(printf 'Uninstalling %d Wine build(s):\n%b' "${#selections[@]}" "$names_list")"
 }
 
 # =============================================================================
@@ -571,7 +600,7 @@ _do_info() {
 while true; do
     ACTION=$(zenity --list \
         --title="$(wt_title "$MODULE")" \
-        --text="<tt>Manage custom Wine installations.\n\nInstall directory:  $INSTALL_BASE\nSymlink directory:  $SYMLINK_DIR</tt>" \
+        --text="$(_wt_box "$(printf 'Manage custom Wine installations.\n\nInstall directory:  %s\nSymlink directory:  %s' "$INSTALL_BASE" "$SYMLINK_DIR")")" \
         --column="Tag" --column="Action" --column="Description" \
         --hide-column=1 --print-column=1 \
         --width=660 --height=380 \

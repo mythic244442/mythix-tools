@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 #  app_launcher.sh — Application Launcher / Shortcut Manager
-#  winetoolz v2.1
+#  winetoolz v3.0
 #
 #  Save named shortcuts (Wine binary + prefix + exe + args + env profile).
 #  Features:
@@ -11,6 +11,7 @@ set -euo pipefail
 #    • Last-launch timestamp tracking
 #    • Icon extraction via wrestool/icotool (graceful fallback)
 #  Shortcuts stored as ~/.config/winetoolz/launchers/<name>.conf
+#  (KEY="value" lines — read as data, never run as shell code)
 #  Icons cached at    ~/.config/winetoolz/icons/<name>.png
 # =============================================================================
 
@@ -29,30 +30,25 @@ mkdir -p "$LAUNCHER_DIR" "$ICON_DIR" "$PROFILE_DIR"
 #  Helpers
 # =============================================================================
 
+SC_KEYS=(SC_NAME SC_WINE SC_PREFIX SC_EXE SC_ARGS SC_ENV SC_ENV_PROFILE SC_WORKDIR SC_LAST_LAUNCH)
+
+# File-name form of a shortcut name: spaces → _, other symbols dropped,
+# no leading dots (hidden files). Empty when nothing usable is left.
 _safe_name() {
-    printf '%s' "$1" | tr -cd '[:alnum:]_. -' | tr ' ' '_'
+    local n="${1// /_}"
+    n="${n//[^[:alnum:]_.-]/}"
+    n="${n#"${n%%[!.]*}"}"
+    printf '%s' "$n"
 }
 
 _load_shortcut() {
     local file="$1"
-    unset SC_NAME SC_WINE SC_PREFIX SC_EXE SC_ARGS SC_ENV SC_ENV_PROFILE SC_WORKDIR SC_LAST_LAUNCH
-    # shellcheck source=/dev/null
-    source "$file"
+    unset "${SC_KEYS[@]}"
+    wt_kv_load "$file" '^SC_' || true
 }
 
 _save_shortcut() {
-    local file="$1"
-    cat > "$file" << CONFEOF
-SC_NAME="${SC_NAME:-}"
-SC_WINE="${SC_WINE:-}"
-SC_PREFIX="${SC_PREFIX:-}"
-SC_EXE="${SC_EXE:-}"
-SC_ARGS="${SC_ARGS:-}"
-SC_ENV="${SC_ENV:-}"
-SC_ENV_PROFILE="${SC_ENV_PROFILE:-}"
-SC_WORKDIR="${SC_WORKDIR:-}"
-SC_LAST_LAUNCH="${SC_LAST_LAUNCH:-}"
-CONFEOF
+    wt_kv_save "$1" "${SC_KEYS[@]}"
 }
 
 # Extract icon from a Windows .exe into the icon cache
@@ -61,33 +57,30 @@ CONFEOF
 _extract_icon() {
     local exe="$1"
     local name="$2"
-    local out="$ICON_DIR/$(_safe_name "$name").png"
+    local out base
+    base="$(_safe_name "$name")"
+    [[ -n "$base" ]] || return 1
+    out="$ICON_DIR/$base.png"
 
     [[ -f "$out" ]] && echo "$out" && return 0  # already cached
 
     command -v wrestool >/dev/null 2>&1 || return 1
     command -v icotool  >/dev/null 2>&1 || return 1
 
-    local tmp_ico
-    tmp_ico="$(mktemp --suffix=.ico)"
-    trap 'rm -f "$tmp_ico"' RETURN
+    local work
+    work="$(mktemp -d)" || return 1
 
-    # Extract largest icon group from exe
-    wrestool -x -t 14 "$exe" -o "$tmp_ico" 2>/dev/null || return 1
-    [[ -s "$tmp_ico" ]] || return 1
-
-    # Convert to PNG, pick the largest size available
-    icotool -x -o "$ICON_DIR" "$tmp_ico" 2>/dev/null || return 1
-
-    # icotool writes files like name_NxN.png — grab the largest
-    local best
-    best="$(ls -S "$ICON_DIR"/$(basename "$tmp_ico" .ico)_*.png 2>/dev/null | head -1 || true)"
-    if [[ -n "$best" ]]; then
-        mv "$best" "$out"
-        # Clean up any other sizes icotool extracted
-        rm -f "$ICON_DIR"/$(basename "$tmp_ico" .ico)_*.png 2>/dev/null || true
-        echo "$out"
+    # Extract largest icon group from exe, convert to PNG, keep the largest
+    if wrestool -x -t 14 "$exe" -o "$work/icon.ico" 2>/dev/null && [[ -s "$work/icon.ico" ]] \
+       && icotool -x -o "$work" "$work/icon.ico" 2>/dev/null; then
+        local best
+        best="$(find "$work" -maxdepth 1 -name '*.png' -printf '%s\t%p\n' | sort -rn | sed -n '1s/^[0-9]*\t//p')"
+        if [[ -n "$best" ]]; then
+            mv -f -- "$best" "$out"
+            echo "$out"
+        fi
     fi
+    rm -rf -- "$work"
 }
 
 # List available env profile names
@@ -128,6 +121,7 @@ while true; do
         "delete"  "Delete Shortcut"    "Remove a saved shortcut" \
         "list"    "List All"           "View all saved shortcuts with details" \
         "exit"    "Back to Main Menu"  "") || break
+    CHOICE="${CHOICE%%|*}"
 
     case "$CHOICE" in
 
@@ -163,6 +157,23 @@ while true; do
 
             _load_shortcut "$SELECTED_FILE"
 
+            # The Wine build may have been updated or removed since.
+            if [[ ! -x "${SC_WINE:-}" ]]; then
+                wt_confirm "$MODULE  ›  Wine Missing" "$(printf 'The Wine build of this shortcut is gone:\n  %s\n\nPick another one for it?' "${SC_WINE:-(none)}")" || continue
+                wt_select_wine_bin "$MODULE  ›  ${SC_NAME:-Shortcut}" || continue
+                SC_WINE="$WT_INNER_WINE"
+            fi
+            if [[ ! -f "${SC_EXE:-}" ]]; then
+                wt_error_return "$(printf 'The program of this shortcut is gone:\n  %s\n\nUse  Edit Shortcut  to pick it again.' "${SC_EXE:-(none)}")"
+                continue
+            fi
+            # Wine would quietly make a fresh, empty prefix in its place.
+            if [[ -z "${SC_PREFIX:-}" || ! -f "$SC_PREFIX/system.reg" ]]; then
+                wt_error_return "$(printf 'The prefix of this shortcut is gone:\n  %s\n\nUse  Edit Shortcut  to pick it again.' "${SC_PREFIX:-(none)}")"
+                continue
+            fi
+            SC_NAME="${SC_NAME:-$(basename "$SELECTED_FILE" .conf)}"
+
             # Stamp last-launch time back into the conf
             SC_LAST_LAUNCH="$(date '+%Y-%m-%d %H:%M')"
             _save_shortcut "$SELECTED_FILE"
@@ -194,27 +205,24 @@ wt_log_info "Exe     : $WT_SC_EXE"
 [[ -n "$WT_SC_ENV_PROFILE" ]] && wt_log_info "Profile : $WT_SC_ENV_PROFILE"
 printf '\n'
 
-# Load named env profile first
+# Load named env profile first (checked for syntax errors first)
 if [[ -n "$WT_SC_ENV_PROFILE" ]]; then
-    pfile="$WT_PROFILE_DIR/${WT_SC_ENV_PROFILE}.env"
-    if [[ -f "$pfile" ]]; then
-        wt_log "Loading env profile: $WT_SC_ENV_PROFILE"
-        # shellcheck source=/dev/null
-        source "$pfile"
-    else
-        wt_log_err "Env profile not found: $pfile  (continuing anyway)"
-    fi
+    wt_log "Loading env profile: $WT_SC_ENV_PROFILE"
+    wt_source_env_profile "$WT_PROFILE_DIR/${WT_SC_ENV_PROFILE}.env" || wt_log_err "(continuing without it)"
 fi
 
-# Apply any inline env vars on top
-if [[ -n "$WT_SC_ENV" ]]; then
-    export $WT_SC_ENV
-fi
+# Apply any inline env vars on top (NAME=value pairs only)
+wt_env_apply "$WT_SC_ENV"
 
 cd "$WT_SC_WORKDIR" 2>/dev/null || true
 
+# Arguments keep their quoting ("C:\My Games\x" stays one argument);
+# .bat / .msi / .lnk files start the way Windows would start them.
+mapfile -d '' -t ARGS < <(wt_split_args "$WT_SC_ARGS")
+wt_windows_cmd "$WT_SC_EXE"
+
 wt_log "Launching..."
-"$WT_INNER_WINE" "$WT_SC_EXE" $WT_SC_ARGS
+"$WT_INNER_WINE" "${WT_WINCMD[@]}" "${ARGS[@]}"
 EXIT_CODE=$?
 printf '\n'
 if [[ $EXIT_CODE -eq 0 ]]; then
@@ -222,10 +230,11 @@ if [[ $EXIT_CODE -eq 0 ]]; then
 else
     wt_log_err "$WT_SC_NAME exited with code $EXIT_CODE."
 fi
-read -rp "  Press Enter to close..." < /dev/tty
+wt_pause
 INNEREOF
             chmod +x "$TMP"
             wt_run_in_terminal "$TMP"
+            rm -f "$TMP"
             ;;
 
         # ------------------------------------------------------------------
@@ -245,7 +254,7 @@ INNEREOF
             SC_EXE=$(zenity --file-selection \
                 --title="$(wt_title "$MODULE  ›  Select Executable")" \
                 --filename="$SC_PREFIX/drive_c/" \
-                --file-filter="Windows executables | *.exe *.EXE *.bat *.BAT" \
+                --file-filter="Windows programs | *.exe *.EXE *.bat *.BAT *.cmd *.msi *.MSI *.lnk" \
                 --width=760) || continue
 
             # Optional: attach an env profile
@@ -269,25 +278,27 @@ INNEREOF
             # Optional: extra inline args + env
             EXTRA=$(zenity --forms \
                 --title="$(wt_title "$MODULE  ›  New Shortcut  —  Optional")" \
-                --text="$(printf '<tt>Optional settings for:  %s</tt>' "$SC_NAME")" \
+                --text="$(_wt_box "$(printf 'Optional settings for:  %s' "$SC_NAME")")" \
                 --add-entry="Launch arguments (optional)" \
                 --add-entry="Extra inline env vars  e.g: DXVK_HUD=1" \
+                --separator=$'\x1f' \
                 --width=580) || true
 
             SC_ARGS=""
             SC_ENV=""
             if [[ -n "$EXTRA" ]]; then
-                SC_ARGS="$(echo "$EXTRA" | cut -d'|' -f1)"
-                SC_ENV="$(echo  "$EXTRA" | cut -d'|' -f2)"
+                IFS=$'\x1f' read -r SC_ARGS SC_ENV _ <<< "$EXTRA" || true
             fi
 
             SC_WORKDIR="$(dirname "$SC_EXE")"
             SC_LAST_LAUNCH=""
 
-            safe=""
-            conf=""
             safe="$(_safe_name "$SC_NAME")"
+            [[ -n "$safe" ]] || safe="shortcut-$(date +%Y%m%d%H%M%S)"
             conf="$LAUNCHER_DIR/${safe}.conf"
+            if [[ -f "$conf" ]]; then
+                wt_confirm "$MODULE" "$(printf 'A shortcut saved as  %s  already exists.\n\nReplace it?' "$safe")" || continue
+            fi
             _save_shortcut "$conf"
 
             # Try icon extraction in background — non-blocking, silent on failure
@@ -320,40 +331,68 @@ INNEREOF
 
             _load_shortcut "$SELECTED_FILE"
 
-            # --- Edit env profile ---
-            NEW_ENV_PROFILE="${SC_ENV_PROFILE:-}"
-            mapfile -t PROFILE_NAMES < <(_list_profiles)
-            if [[ ${#PROFILE_NAMES[@]} -gt 0 ]]; then
-                PROF_ARGS=("(none)" "(none) — remove env profile")
-                for n in "${PROFILE_NAMES[@]}"; do PROF_ARGS+=("$n" "$n"); done
-                NEW_ENV_PROFILE=$(zenity --list \
-                    --title="$(wt_title "$MODULE  ›  Env Profile  —  $SC_NAME")" \
-                    --text="$(printf '<tt>Current profile:  %s\n\nSelect a new profile or (none):</tt>' "${SC_ENV_PROFILE:-(none)}")" \
-                    --column="Key" --column="Profile" \
+            # --- Edit: one field at a time until Save ---
+            while :; do
+                FIELD=$(zenity --list \
+                    --title="$(wt_title "$MODULE  ›  Edit  —  ${SC_NAME:-}")" \
+                    --text="$(_wt_box "Pick what to change, then Save.")" \
+                    --column="Key" --column="Field" --column="Current value" \
                     --hide-column=1 --print-column=1 \
-                    --width=500 --height=320 \
-                    "${PROF_ARGS[@]}") || NEW_ENV_PROFILE="${SC_ENV_PROFILE:-}"
-                [[ "$NEW_ENV_PROFILE" == "(none)" ]] && NEW_ENV_PROFILE=""
-            fi
-            SC_ENV_PROFILE="$NEW_ENV_PROFILE"
+                    --width=820 --height=420 \
+                    "name"    "Name"             "${SC_NAME:-}" \
+                    "wine"    "Wine build"       "${SC_WINE:-}" \
+                    "prefix"  "Prefix"           "${SC_PREFIX:-}" \
+                    "exe"     "Program"          "${SC_EXE:-}" \
+                    "args"    "Launch arguments" "${SC_ARGS:-(none)}" \
+                    "env"     "Inline env vars"  "${SC_ENV:-(none)}" \
+                    "profile" "Env profile"      "${SC_ENV_PROFILE:-(none)}" \
+                    "save"    "✔  Save"           "") || continue 2
+                FIELD="${FIELD%%|*}"
 
-            # --- Edit name/args/env ---
-            EXTRA=$(zenity --forms \
-                --title="$(wt_title "$MODULE  ›  Edit  —  $SC_NAME")" \
-                --text="<tt>Edit fields (leave blank to keep current value):\n\nCurrent args    : ${SC_ARGS:-}\nCurrent env     : ${SC_ENV:-}</tt>" \
-                --add-entry="Shortcut name" \
-                --add-entry="Launch arguments" \
-                --add-entry="Extra inline env vars" \
-                --width=600) || continue
-
-            new_name="" new_args="" new_env=""
-            new_name="$(echo "$EXTRA" | cut -d'|' -f1)"
-            new_args="$(echo "$EXTRA" | cut -d'|' -f2)"
-            new_env="$(echo  "$EXTRA" | cut -d'|' -f3)"
-
-            [[ -n "$new_name" ]] && SC_NAME="$new_name"
-            [[ -n "$new_args" ]] && SC_ARGS="$new_args"
-            [[ -n "$new_env"  ]] && SC_ENV="$new_env"
+                case "$FIELD" in
+                    name|args|env)
+                        case "$FIELD" in
+                            name) cur="${SC_NAME:-}" ;; args) cur="${SC_ARGS:-}" ;; env) cur="${SC_ENV:-}" ;;
+                        esac
+                        val=$(zenity --entry \
+                            --title="$(wt_title "$MODULE  ›  Edit")" \
+                            --text="$(_wt_box "New value (empty clears it):")" \
+                            --entry-text="$cur" \
+                            --width=600) || continue
+                        case "$FIELD" in
+                            name) [[ -n "$val" ]] && SC_NAME="$val" ;;
+                            args) SC_ARGS="$val" ;;
+                            env)  SC_ENV="$val" ;;
+                        esac
+                        ;;
+                    wine)
+                        wt_select_wine_bin "$MODULE  ›  Edit" && SC_WINE="$WT_INNER_WINE" ;;
+                    prefix)
+                        wt_select_prefix_from_config "$MODULE  ›  Edit" && SC_PREFIX="$WINEPREFIX" ;;
+                    exe)
+                        val=$(zenity --file-selection \
+                            --title="$(wt_title "$MODULE  ›  Select Executable")" \
+                            --filename="${SC_PREFIX:-$HOME}/drive_c/" \
+                            --file-filter="Windows programs | *.exe *.EXE *.bat *.BAT *.cmd *.msi *.MSI *.lnk" \
+                            --width=760) && { SC_EXE="$val"; SC_WORKDIR="$(dirname "$val")"; }
+                        ;;
+                    profile)
+                        mapfile -t PROFILE_NAMES < <(_list_profiles)
+                        PROF_ARGS=("(none)" "(none) — no env profile")
+                        for n in "${PROFILE_NAMES[@]}"; do PROF_ARGS+=("$n" "$n"); done
+                        val=$(zenity --list \
+                            --title="$(wt_title "$MODULE  ›  Env Profile")" \
+                            --column="Key" --column="Profile" \
+                            --hide-column=1 --print-column=1 \
+                            --width=500 --height=320 \
+                            "${PROF_ARGS[@]}") || continue
+                        val="${val%%|*}"
+                        [[ "$val" == "(none)" ]] && val=""
+                        SC_ENV_PROFILE="$val"
+                        ;;
+                    save|*) break ;;
+                esac
+            done
 
             _save_shortcut "$SELECTED_FILE"
             wt_info "$MODULE" "$(printf '✔  Shortcut updated:\n\n  Name    : %s\n  Profile : %s\n  Args    : %s' \
@@ -384,10 +423,15 @@ INNEREOF
 
             [[ -z "$TO_DELETE" ]] && continue
 
-            wt_confirm "$MODULE  ›  Delete" \
-                "$(printf 'Delete the following shortcuts?\n\n%s' "$TO_DELETE")" || continue
-
             IFS='|' read -ra DEL_FILES <<< "$TO_DELETE"
+            DEL_NAMES=""
+            for f in "${DEL_FILES[@]}"; do
+                _load_shortcut "$f"
+                DEL_NAMES+="  •  ${SC_NAME:-$(basename "$f" .conf)}"$'\n'
+            done
+            wt_confirm "$MODULE  ›  Delete" \
+                "$(printf 'Delete the following shortcuts?\n\n%s' "$DEL_NAMES")" || continue
+
             for f in "${DEL_FILES[@]}"; do
                 _load_shortcut "$f"
                 rm -f "$f"

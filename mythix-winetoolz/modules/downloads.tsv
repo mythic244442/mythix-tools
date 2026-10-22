@@ -1,0 +1,56 @@
+# winetoolz download catalog — every redistributable the installers fetch.
+#
+#   <key>  <sha256, or - for links the vendor updates in place>  <cache file name>  <url> [mirror ...]
+#
+# Pinned sums are the ones winetricks verifies for the same files (fxc2, d3drm:
+# checked against downloads of the pinned URLs). An unpinned file must still
+# be a real installer (magic bytes) and is fetched again after 30 days.
+# Mirrors are only ever used for pinned files.
+
+# --- DirectX redistributables (cabinets the DLL Installer takes DLLs from) ---
+dx_jun2010          053f76dcbb28802e23341b6a787e3b0791c0fa5c8d4d011b1044172dbf89c73b  directx_Jun2010_redist.exe              https://download.microsoft.com/download/8/4/A/84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe  https://files.holarse-linuxgaming.de/mirrors/microsoft/directx_Jun2010_redist.exe
+dx_feb2010          f6d191e89a963d7cca34f169d30f49eab99c1ed3bb92da73ec43617caaa1e93f  directx_feb2010_redist.exe              https://web.archive.org/web/20100205000000id_/https://download.microsoft.com/download/E/E/1/EE17FF74-6C45-4575-9CF4-7FC2597ACD18/directx_feb2010_redist.exe  https://files.holarse-linuxgaming.de/mirrors/microsoft/directx_feb2010_redist.exe
+
+# --- Single DLLs and small packages ---
+d3dcompiler_47_x64  4432bbd1a390874f3f0a503d45cc48d346abc3a8c0213c289f4b615bf0ee84f3  d3dcompiler_47.dll                      https://raw.githubusercontent.com/mozilla/fxc2/807d26f4e4e9e9d0d0d6c1e05493b28eafb20e91/dll/d3dcompiler_47.dll
+d3dcompiler_47_x86  2ad0d4987fc4624566b190e747c9d95038443956ed816abfd1e2d389b5ec0851  d3dcompiler_47_32.dll                   https://raw.githubusercontent.com/mozilla/fxc2/807d26f4e4e9e9d0d0d6c1e05493b28eafb20e91/dll/d3dcompiler_47_32.dll
+d3drm               fd80f3839a035b6b52362735b22eb8d2523d3434bf18afb3e0f1b5ace84357b0  d3drm.dll                               https://downloads.sourceforge.net/project/dxwnd/Redist/d3drm.dll
+cnc_ddraw           f9640f69c2b8c012b97720ce0a9aac483989563908fc19446b9d1ba16e7239d6  cnc-ddraw.zip                           https://github.com/FunkyFr3sh/cnc-ddraw/releases/download/v7.0.0.0/cnc-ddraw.zip
+dinputto8           8f1e53a55c66f870b91c1e43a39c02a4a87900cf453776de41643863bdfa00e6  dinput_dinputto8.dll                    https://github.com/elishacloud/dinputto8/releases/download/v1.0.92.0/dinput.dll
+msxml3              f9c678f8217e9d4f9647e8a1f6d89a7c26a57b9e9e00d39f7487493dd7b4e36c  msxml3.msi                              https://media.codeweavers.com/pub/other/msxml3.msi
+msxml6              260cd870851ffc3c6d10b71691f134e20d8d03ac26073bb36951eacb7aa85897  msxml6-KB2957482-enu-amd64.exe          https://download.microsoft.com/download/2/7/7/277681BE-4048-4A58-ABBA-259C465B1699/msxml6-KB2957482-enu-amd64.exe
+physx_legacy        -                                                                 PhysX-9.13.0604-SystemSoftware-Legacy.msi  https://us.download.nvidia.com/Windows/9.13.0604/PhysX-9.13.0604-SystemSoftware-Legacy.msi
+openal              d165bcb7628fd950d14847585468cc11943b2a1da92a59a839d397c68f9d4b06  oalinst.zip                             https://www.openal.org/downloads/oalinst.zip
+xna40               e6c41d692ebcba854dad4b1c52bb7ddd05926bad3105595d6596b8bab01c25e7  xnafx40_redist.msi                      https://web.archive.org/web/20120325002813/https://download.microsoft.com/download/A/C/2/AC2C903B-E6E8-42C2-9FD7-BEBAC362A930/xnafx40_redist.msi
+
+# --- .NET Framework (offline installers) ---
+dotnet452           6c2c589132e830a185c5f40f82042bee3022e721a216680bd9b3995ba86f3781  NDP452-KB2901907-x86-x64-AllOS-ENU.exe  https://download.microsoft.com/download/E/2/1/E21644B5-2DF2-47C2-91BD-63C560427900/NDP452-KB2901907-x86-x64-AllOS-ENU.exe
+dotnet462           b4cbb4bc9a3983ec3be9f80447e0d619d15256a9ce66ff414ae6e3856705e237  NDP462-KB3151800-x86-x64-AllOS-ENU.exe  https://download.visualstudio.microsoft.com/download/pr/8e396c75-4d0d-41d3-aea8-848babc2736a/80b431456d8866ebe053eb8b81a168b3/NDP462-KB3151800-x86-x64-AllOS-ENU.exe
+dotnet472           5cb624b97f9fd6d3895644c52231c9471cd88aacb57d6e198d3024a1839139f6  NDP472-KB4054530-x86-x64-AllOS-ENU.exe  https://download.visualstudio.microsoft.com/download/pr/1f5af042-d0e4-4002-9c59-9ba66bcf15f6/089f837de42708daacaae7c04b7494db/NDP472-KB4054530-x86-x64-AllOS-ENU.exe
+dotnet48            95889d6de3f2070c07790ad6cf2000d33d9a1bdfc6a381725ab82ab1c314fd53  ndp48-x86-x64-allos-enu.exe             https://download.visualstudio.microsoft.com/download/pr/7afca223-55d2-470a-8edc-6a1739ae3252/abd170b4b0ec15ad0222a809b761a036/ndp48-x86-x64-allos-enu.exe
+
+# --- .NET Desktop Runtimes (latest patch of each version) ---
+dotnet6_x64         -  windowsdesktop-runtime-6-win-x64.exe   https://aka.ms/dotnet/6.0/windowsdesktop-runtime-win-x64.exe
+dotnet6_x86         -  windowsdesktop-runtime-6-win-x86.exe   https://aka.ms/dotnet/6.0/windowsdesktop-runtime-win-x86.exe
+dotnet8_x64         -  windowsdesktop-runtime-8-win-x64.exe   https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe
+dotnet8_x86         -  windowsdesktop-runtime-8-win-x86.exe   https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x86.exe
+dotnet9_x64         -  windowsdesktop-runtime-9-win-x64.exe   https://aka.ms/dotnet/9.0/windowsdesktop-runtime-win-x64.exe
+dotnet9_x86         -  windowsdesktop-runtime-9-win-x86.exe   https://aka.ms/dotnet/9.0/windowsdesktop-runtime-win-x86.exe
+dotnet10_x64        -  windowsdesktop-runtime-10-win-x64.exe  https://aka.ms/dotnet/10.0/windowsdesktop-runtime-win-x64.exe
+dotnet10_x86        -  windowsdesktop-runtime-10-win-x86.exe  https://aka.ms/dotnet/10.0/windowsdesktop-runtime-win-x86.exe
+
+# --- Visual C++ runtimes ---
+vc2005_x86          8648c5fc29c44b9112fe52f9a33f80e7fc42d10f3b5b42b2121542a13e44adfd  vcredist2005_x86.exe  https://download.microsoft.com/download/8/B/4/8B42259F-5D70-43F4-AC2E-4B208FD8D66A/vcredist_x86.EXE
+vc2005_x64          4487570bd86e2e1aac29db2a1d0a91eb63361fcaac570808eb327cd4e0e2240d  vcredist2005_x64.exe  https://download.microsoft.com/download/8/B/4/8B42259F-5D70-43F4-AC2E-4B208FD8D66A/vcredist_x64.EXE
+vc2008_x86          8742bcbf24ef328a72d2a27b693cc7071e38d3bb4b9b44dec42aa3d2c8d61d92  vcredist2008_x86.exe  https://download.microsoft.com/download/5/D/8/5D8C65CB-C849-4025-8E95-C3966CAFD8AE/vcredist_x86.exe
+vc2008_x64          c5e273a4a16ab4d5471e91c7477719a2f45ddadb76c7f98a38fa5074a6838654  vcredist2008_x64.exe  https://download.microsoft.com/download/5/D/8/5D8C65CB-C849-4025-8E95-C3966CAFD8AE/vcredist_x64.exe
+vc2010_x86          31d32fa39d52cac9a765a43660431f7a127eee784b54b2f5e2af3e2b763a1af8  vcredist2010_x86.exe  https://download.microsoft.com/download/5/B/C/5BC5DBB3-652D-4DCE-B14A-475AB85EEF6E/vcredist_x86.exe
+vc2010_x64          2fddbc3aaaab784c16bc673c3bae5f80929d5b372810dbc28649283566d33255  vcredist2010_x64.exe  https://download.microsoft.com/download/A/8/0/A80747C3-41BD-45DF-B505-E9710D2744E0/vcredist_x64.exe
+vc2012_x86          b924ad8062eaf4e70437c8be50fa612162795ff0839479546ce907ffa8d6e386  vcredist2012_x86.exe  https://download.microsoft.com/download/1/6/B/16B06F60-3B20-4FF2-B699-5E9B7962F9AE/VSU_4/vcredist_x86.exe
+vc2012_x64          681be3e5ba9fd3da02c09d7e565adfa078640ed66a0d58583efad2c1e3cc4064  vcredist2012_x64.exe  https://download.microsoft.com/download/1/6/B/16B06F60-3B20-4FF2-B699-5E9B7962F9AE/VSU_4/vcredist_x64.exe
+vc2013_x86          89f4e593ea5541d1c53f983923124f9fd061a1c0c967339109e375c661573c17  vcredist2013_x86.exe  https://download.microsoft.com/download/0/5/6/056dcda9-d667-4e27-8001-8a0c6971d6b1/vcredist_x86.exe
+vc2013_x64          20e2645b7cd5873b1fa3462b99a665ac8d6e14aae83ded9d875fea35ffdd7d7e  vcredist2013_x64.exe  https://download.microsoft.com/download/0/5/6/056dcda9-d667-4e27-8001-8a0c6971d6b1/vcredist_x64.exe
+vc14_x86            -  vc14_vc_redist.x86.exe  https://aka.ms/vc14/vc_redist.x86.exe
+vc14_x64            -  vc14_vc_redist.x64.exe  https://aka.ms/vc14/vc_redist.x64.exe
+vc17_x86            -  vc17_vc_redist.x86.exe  https://aka.ms/vs/17/release/vc_redist.x86.exe
+vc17_x64            -  vc17_vc_redist.x64.exe  https://aka.ms/vs/17/release/vc_redist.x64.exe

@@ -166,7 +166,6 @@ INNEREOF
 
             VIEW_ARGS=()
             for f in "${LOG_FILES[@]}"; do
-                local size
                 size="$(du -sh "$f" 2>/dev/null | cut -f1 || echo "?")"
                 VIEW_ARGS+=("$f" "$(basename "$f")" "$size" "$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null || echo ?)")
             done
