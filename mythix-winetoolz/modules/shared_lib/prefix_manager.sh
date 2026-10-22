@@ -370,7 +370,7 @@ _list_builds() {
 
 action_build_manager() {
     if [[ ! -d "$BUILDZ" ]]; then
-        wt_info "$MODULE" "$(printf 'Wine build directory not found:\n  %s\n\nThe Runtime Manager (Wine menu) downloads builds into it.' "$BUILDZ")"
+        wt_info "$MODULE" "$(printf 'Wine build directory not found:\n  %s\n\nRuntime Downloads (Wine menu) puts builds there.' "$BUILDZ")"
         return 0
     fi
 
@@ -404,7 +404,11 @@ action_build_manager() {
         --width=820 --height=400 \
         "${rows[@]}") || return 0
     chosen="${chosen%%|*}"
-    [[ -n "$chosen" && "$chosen" == "$BUILDZ"/* ]] || return 0
+    local listed=0
+    for b in "${builds[@]}"; do
+        if [[ "$b" == "$chosen" ]]; then listed=1; fi
+    done
+    (( listed )) || return 0
 
     # Action on chosen build
     local build_action

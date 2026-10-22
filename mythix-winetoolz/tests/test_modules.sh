@@ -749,6 +749,43 @@ test_system_file_installer_from_zip() {
     log_has "Installed 2 file(s)"
 }
 
+test_system_file_installer_names_and_skips() {
+    fixture_wine
+    local work="$KIT_TMP/zipsrc2"
+    mkdir -p "$work/DLLS" "$work/sys" "$work/a" "$work/b" "$work/ctl"
+    fake_pe "$work/DLLS/D3DX9_43.DLL" x86
+    fake_pe "$work/sys/ntdll.dll" x86
+    fake_pe "$work/a/dup.dll" x86; printf 'first' >> "$work/a/dup.dll"
+    fake_pe "$work/b/dup.dll" x86; printf 'second' >> "$work/b/dup.dll"
+    fake_pe "$work/ctl/thing.ocx" x86
+    (cd "$work" && python3 -I -c 'import zipfile,sys; z=zipfile.ZipFile(sys.argv[1],"w"); [z.write(p) for p in sys.argv[2:]]' \
+        "$KIT_TMP/pack2.zip" DLLS/D3DX9_43.DLL sys/ntdll.dll a/dup.dll b/dup.dll ctl/thing.ocx)
+    local pfx="$HOME/prefixes/p" wow
+    fake_prefix "$pfx" win64
+    wow="$pfx/drive_c/windows/syswow64"
+    builtin_dll "$wow/ntdll.dll"
+    builtin_dll "$wow/d3dx9_43.dll"
+    wt_kit_answer 0 "$HOME/$FAKE_WINE_REL"
+    wt_kit_answer 0 "$pfx"
+    wt_kit_answer 0 "Select Local Archive"
+    wt_kit_answer 0 "$KIT_TMP/pack2.zip"
+    wt_kit_answer 0 "Install ALL 32-bit"
+    run_module install_components-x86_64.sh || fail "run failed: $(tail -5 "$KIT_TMP/module.out")"
+    # the prefix's own lower-case name, Wine's copy backed up
+    cmp -s "$work/DLLS/D3DX9_43.DLL" "$wow/d3dx9_43.dll" || fail "d3dx9_43.dll not replaced"
+    [[ ! -e "$wow/D3DX9_43.DLL" ]] || fail "upper-case copy next to Wine's own"
+    wt_dll_is_wine_builtin "$wow/d3dx9_43.dll.wt_bak" || fail "builtin d3dx9_43 not backed up"
+    wt_dll_is_wine_builtin "$wow/ntdll.dll" || fail "Wine's ntdll.dll was replaced"
+    cmp -s "$work/a/dup.dll" "$wow/dup.dll" || fail "the first dup.dll should win"
+    local calls; calls="$(wine_calls)"
+    assert_contains "$calls" "/v d3dx9_43 /d native,builtin"
+    assert_contains "$calls" "/v thing.ocx /d native,builtin" "override of an .ocx keeps its extension"
+    assert_not_contains "$calls" "/v ntdll "
+    log_has "skipped: Wine's own core DLL"
+    log_has "skipped: another dup.dll was installed"
+    log_has "Installed 3 file(s)"
+}
+
 # --- real Wine -----------------------------------------------------------------
 
 real_wine_dxvk_cycle() {  # <arch> <source prefix> <loader>

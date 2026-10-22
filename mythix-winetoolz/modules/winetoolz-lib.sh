@@ -223,10 +223,6 @@ wt_human_size() {
     fi
 }
 
-# wt_q <value>
-#   Shell-quote a value for embedding in a generated script.
-wt_q() { printf '%q' "$1"; }
-
 # =============================================================================
 #  DEPENDENCY CHECK
 # =============================================================================
@@ -318,9 +314,7 @@ wt_missing_cmds() {
 wt_require_cmds() {
     local -a missing=() pkgs=()
     local cmd pm p
-    for cmd in "$@"; do
-        _wt_have "$cmd" || missing+=("$cmd")
-    done
+    mapfile -t missing < <(wt_missing_cmds "$@")
     (( ${#missing[@]} )) || return 0
 
     pm="$(_wt_pkg_manager)"
@@ -956,7 +950,8 @@ for row in rows():
 
 # _wt_archive_kind <file>
 #   tgz | txz | tzst | tbz2 | tar | zip | 7z | cab | exe | unknown (by name).
-#   An .exe is a self-extracting installer: a cabinet, or anything 7z opens.
+#   An .exe is a self-extracting installer: a cabinet, or anything 7z opens;
+#   a .rar is unpacked (and checked) by 7z.
 _wt_archive_kind() {
     local n="${1,,}"
     case "$n" in
@@ -966,7 +961,7 @@ _wt_archive_kind() {
         *.tar.bz2|*.tbz2|*.tbz)        echo tbz2 ;;
         *.tar)                         echo tar ;;
         *.zip)                         echo zip ;;
-        *.7z)                          echo 7z ;;
+        *.7z|*.rar)                    echo 7z ;;
         *.cab)                         echo cab ;;
         *.exe)                         echo exe ;;
         *)                             echo unknown ;;
@@ -1034,8 +1029,17 @@ wt_archive_check() {
             fi ;;
         7z)
             _wt_have 7z || { WT_ARCHIVE_ERROR="7z is required for $archive"; return 1; }
-            listing="$(7z l -slt -- "$archive" 2>/dev/null | sed -n '/^----------$/,$ s/^Path = //p')" || {
-                WT_ARCHIVE_ERROR="Not a readable 7z archive: $archive"; return 1; } ;;
+            local slt
+            slt="$(7z l -slt -- "$archive" 2>/dev/null)" || {
+                WT_ARCHIVE_ERROR="Not a readable 7z archive: $archive"; return 1; }
+            listing="$(sed -n '/^----------$/,$ s/^Path = //p' <<< "$slt")"
+            if (( ! allow_links )); then
+                # p7zip 16.02 writes through links it has just made; newer
+                # 7-Zip refuses, but not every distro ships it yet.
+                links="$(awk '/^----------$/ { s = 1 }
+                              s && /^Path = / { p = substr($0, 8) }
+                              s && /^Attributes = / && / l[r-][w-][xsStT-]/ { print p }' <<< "$slt")"
+            fi ;;
         cab)
             _wt_have cabextract || { WT_ARCHIVE_ERROR="cabextract is required for $archive"; return 1; }
             listing="$(cabextract -l -- "$archive" 2>/dev/null | sed -n 's/^.* | .* | //p')" || {
@@ -2006,25 +2010,6 @@ wt_reg_value() {
         if [[ "${name,,}" == "${3,,}" ]]; then printf '%s' "$val"; return 0; fi
     done < <(wt_reg_section "$1" "$2")
     return 0
-}
-
-# wt_wrapper_run <command...>
-#   Runs a command through the selected Proton/Neutron wrapper the way Steam
-#   does — `<wrapper> run <command>` with STEAM_COMPAT_DATA_PATH set to the
-#   compatdata folder that holds $WINEPREFIX. Without that variable Proton
-#   exits ("No compat data path?") and Neutron silently uses its own
-#   ~/.wine-neutron-pfx instead of the selected prefix. Prefixes that are not
-#   in compatdata layout (…/pfx) and plain Wine run the inner wine directly.
-wt_wrapper_run() {
-    if [[ -z "${WT_WRAPPER:-}" || "$(basename "${WINEPREFIX:-}")" != pfx ]]; then
-        "$WT_INNER_WINE" "$@"
-        return
-    fi
-    local steam=""
-    steam="$(_wt_steam_roots | sed -n 1p)" || steam=""
-    STEAM_COMPAT_DATA_PATH="$(dirname "$WINEPREFIX")" \
-    STEAM_COMPAT_CLIENT_INSTALL_PATH="${STEAM_COMPAT_CLIENT_INSTALL_PATH:-$steam}" \
-        "$WT_WRAPPER" run "$@"
 }
 
 # =============================================================================

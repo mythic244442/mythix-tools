@@ -85,8 +85,8 @@ BANNER
 printf '\n'
 printf '  ╔══════════════════════════════════════════════════════════════╗\n'
 printf '  ║                                                              ║\n'
-printf '  ║  🍷  winetoolz  v%-4s  —  mythix edition                      ║\n' "${WT_VERSION}"
-printf '  ║      Wine prefix manager  •  DXVK  •  runtimes              ║\n'
+printf '  ║  🍷  winetoolz  v%-4s  —  mythix edition                     ║\n' "${WT_VERSION}"
+printf '  ║      Wine prefix manager  •  DXVK  •  runtimes               ║\n'
 printf '  ║                                                              ║\n'
 printf '  ╚══════════════════════════════════════════════════════════════╝\n'
 printf '\e[0m\n'

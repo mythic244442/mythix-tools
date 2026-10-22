@@ -45,8 +45,8 @@ test_wine_tools_run_in_the_prefix() {
     grep -qx "WINEPREFIX=$pfx" "$KIT_TMP/wine-env.last" || fail "Wine did not run in the chosen prefix"
     assert_contains "$(wt_kit_terminal_log)" "Registry Editor closed."
     log_has "No Wine processes are running in this prefix."
-    local i
-    for i in $(seq 20); do [[ -s "$KIT_TMP/fake-cmds.log" ]] && break; sleep 0.1; done
+    local _
+    for _ in $(seq 20); do [[ -s "$KIT_TMP/fake-cmds.log" ]] && break; sleep 0.1; done
     assert_contains "$(cat "$KIT_TMP/fake-cmds.log" 2>/dev/null)" "xdg-open $pfx/drive_c"
 }
 
@@ -58,13 +58,15 @@ OVR_KEY='HKEY_CURRENT_USER\Software\Wine\DllOverrides'
 APPS_KEY='HKEY_CURRENT_USER\Software\Wine\AppDefaults'
 
 fixture_reg_prefix() {  # <prefix> — a fake Wine with a working reg.exe and
-                        # three overrides already set (Game.exe made by hand)
+                        # four overrides already set (two keys made by hand,
+                        # in their own letter case)
     local w="$HOME/$FAKE_WINE_REL"
     fake_wine_reg "$w"
     fake_prefix "$1" win64
     WINEPREFIX="$1" "$w" reg add "$OVR_KEY" /v d3d9 /d native,builtin /f
     WINEPREFIX="$1" "$w" reg add "$OVR_KEY" /v xinput1_3 /d "" /f
     WINEPREFIX="$1" "$w" reg add "$APPS_KEY\\Game.exe\\DllOverrides" /v dinput8 /d native /f
+    WINEPREFIX="$1" "$w" reg add "$APPS_KEY\\other.exe\\dlloverrides" /v d3dx9_43 /d native /f
     : > "$KIT_TMP/wine-calls.log"
 }
 
@@ -100,6 +102,7 @@ test_overrides_view_add_preset_remove() {
     assert_eq 1 "$(text_count 'd3d11 +native +Game\.exe only')" "last view: new per-program override"
     assert_eq 1 "$(text_count 'dxgi +disabled +all programs')" "last view: disabled dxgi"
     assert_eq 2 "$(text_count 'd3d9 +native,builtin +all programs')" "d3d9 in both views"
+    assert_eq 2 "$(text_count 'd3dx9_43 +native +other\.exe only')" "override under a lower-case dlloverrides key"
     log_has "Override set:"
 }
 

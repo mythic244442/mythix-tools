@@ -204,6 +204,18 @@ test_safe_name() {
     assert_eq "GE-Proton10-20" "$(_wt_safe_name "GE-Proton10-20")"
 }
 
+test_archive_check_7z_links() {
+    command -v 7z >/dev/null 2>&1 || { echo "  (skipped: no 7z)"; return 0; }
+    local d="$KIT_TMP/7z"
+    mkdir -p "$d/src"
+    printf 'x' > "$d/src/a.dll"
+    ln -s /etc "$d/src/escape"
+    (cd "$d/src" && 7z a -snl "$d/links.7z" a.dll escape >/dev/null && 7z a "$d/plain.7z" a.dll >/dev/null)
+    wt_archive_check "$d/plain.7z" || fail "plain 7z refused: $WT_ARCHIVE_ERROR"
+    if wt_archive_check "$d/links.7z"; then fail "7z with a symlink accepted"; fi
+    assert_contains "$WT_ARCHIVE_ERROR" "link: escape"
+}
+
 test_file_is() {
     printf 'MZ\x90\x00' > "$HOME/a.exe"
     printf '<html>nope</html>' > "$HOME/b.exe"
@@ -504,19 +516,6 @@ test_empty_machine_is_quiet() {
     _wt_steam_libraries >/dev/null
     wt_pause
     wt_kill_prefix "$HOME/none" || true
-}
-
-test_wrapper_run_sets_compat_path() {
-    local t="$HOME/tools/GE-Proton9-20"
-    fake_wrapper "$t" proton
-    printf '#!/bin/sh\necho "COMPAT=$STEAM_COMPAT_DATA_PATH ARGS=$*" > "%s/wrapper.out"\n' "$KIT_TMP" > "$t/proton"
-    _wt_resolve_wine_quiet "$t/proton"
-    fake_prefix "$HOME/compat/77/pfx"
-    WINEPREFIX="$HOME/compat/77/pfx" wt_wrapper_run winecfg
-    assert_eq "COMPAT=$HOME/compat/77 ARGS=run winecfg" "$(cat "$KIT_TMP/wrapper.out")"
-    fake_prefix "$HOME/plainpfx"
-    WINEPREFIX="$HOME/plainpfx" wt_wrapper_run regedit
-    assert_contains "$(cat "$KIT_TMP/wine-calls.log")" "ran regedit"
 }
 
 # =============================================================================

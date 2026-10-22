@@ -90,25 +90,14 @@ fi
 case "$(_wt_archive_kind "$ARCHIVE_FILE")" in
     exe|cab) _wt_have cabextract || _wt_have 7z || wt_require_cmds cabextract ;;
     zip)     wt_require_cmds unzip ;;
-    7z)      wt_require_cmds 7z ;;
-    unknown)
-        if [[ "${ARCHIVE_FILE,,}" == *.rar ]]; then
-            wt_require_cmds 7z
-        else
-            wt_error "$(printf 'Unsupported archive format:\n  %s\n\nSupported formats:  .exe  .cab  .zip  .7z  .rar' "$(basename "$ARCHIVE_FILE")")"
-        fi ;;
+    7z)      wt_require_cmds 7z ;;       # .7z and .rar
+    *)       wt_error "$(printf 'Unsupported archive format:\n  %s\n\nSupported formats:  .exe  .cab  .zip  .7z  .rar' "$(basename "$ARCHIVE_FILE")")" ;;
 esac
 
 EXTRACT_DIR="$TMP_DIR/extracted"
 wt_pulse_start "$MODULE" "Extracting $(basename "$ARCHIVE_FILE")..."
 EXTRACT_OK=true
-if [[ "${ARCHIVE_FILE,,}" == *.rar ]]; then
-    mkdir -p "$EXTRACT_DIR"
-    7z x -y -bd -o"$EXTRACT_DIR" -- "$ARCHIVE_FILE" >/dev/null 2>&1 || EXTRACT_OK=false
-    WT_ARCHIVE_ERROR="7z could not extract the archive."
-else
-    wt_extract "$ARCHIVE_FILE" "$EXTRACT_DIR" || EXTRACT_OK=false
-fi
+wt_extract "$ARCHIVE_FILE" "$EXTRACT_DIR" || EXTRACT_OK=false
 # Installers often keep their DLLs one cabinet deeper (DirectX-style).
 $EXTRACT_OK && wt_extract_nested_cabs "$EXTRACT_DIR"
 wt_pulse_stop
@@ -216,30 +205,48 @@ fi
 
 REPORT=""
 FAILURES=0
+INSTALLED=0
+
+# Wine's core DLLs only ever work as Wine's own builtins: a Windows copy of
+# one of these makes every program in the prefix fail to start.
+CORE_DLLS=" ntdll.dll kernel32.dll kernelbase.dll user32.dll gdi32.dll win32u.dll wow64.dll wow64cpu.dll wow64win.dll "
 
 # install_dll_batch <files array name> <target dir> <arch label>
-#   Copies the files in (Wine's originals kept as .wt_bak, never through a
-#   symlink), registers the COM servers among them, and sets native,builtin
-#   overrides — through Wine's registry, so a running wineserver can't
-#   overwrite them.
+#   Copies the files in under lower-case names like the prefix's own (Wine's
+#   originals kept as .wt_bak, never through a symlink), registers the COM
+#   servers among them, and sets native,builtin overrides — through Wine's
+#   registry, so a running wineserver can't overwrite them. An override is
+#   named after the file without ".dll" (other extensions stay: foo.ocx).
 install_dll_batch() {
     local -n _files=$1
     local target_dir="$2"
     local arch_label="$3"
     local fpath base name
+    local -A seen=()
 
     (( ${#_files[@]} )) || return 0
     REPORT+="$(printf '%s  →  %s\n' "$arch_label" "$(basename "$target_dir")")"$'\n'
 
     for fpath in "${_files[@]}"; do
         base="$(basename "$fpath")"
+        base="${base,,}"
+        if [[ "$CORE_DLLS" == *" $base "* ]]; then
+            REPORT+="  –  $base  (skipped: Wine's own core DLL)"$'\n'
+            continue
+        fi
+        if [[ -n "${seen[$base]:-}" ]]; then
+            REPORT+="  –  ${fpath#"$EXTRACT_DIR"/}  (skipped: another $base was installed)"$'\n'
+            continue
+        fi
+        seen[$base]=1
         if wt_dll_put "$fpath" "$target_dir" "$base" 2>/dev/null; then
-            name="${base%.*}"
-            if [[ "${base,,}" == *.dll || "${base,,}" == *.ocx ]] \
+            name="${base%.dll}"
+            if [[ "$base" == *.dll || "$base" == *.ocx ]] \
                && grep -aq DllRegisterServer "$target_dir/$base" 2>/dev/null; then
                 ( cd "$target_dir" && "$WT_INNER_WINE" "$target_dir/regsvr32.exe" /s "$base" >/dev/null 2>&1 ) || true
             fi
-            if wt_dll_override "${name,,}" native,builtin; then
+            INSTALLED=$((INSTALLED + 1))
+            if wt_dll_override "$name" native,builtin; then
                 REPORT+="  ✔  $base"$'\n'
             else
                 REPORT+="  ✔  $base  (override could not be set)"$'\n'
@@ -260,6 +267,8 @@ wt_pulse_stop
 
 if (( FAILURES )); then
     wt_warn "$MODULE" "$(printf '%d of %d file(s) had problems:\n\n%s\nPrefix:\n  %s' "$FAILURES" "$TOTAL_FILES" "$REPORT" "$WINEPREFIX")"
+elif (( INSTALLED == 0 )); then
+    wt_info "$MODULE" "$(printf 'Nothing was installed:\n\n%s' "$REPORT")"
 else
-    wt_info "$MODULE" "$(printf '✔  COMPLETE\n─────────────────────────────────────\nInstalled %d file(s) into:\n  %s\n\n%s\nWine'"'"'s originals were kept as <name>.wt_bak.' "$TOTAL_FILES" "$WINEPREFIX" "$REPORT")"
+    wt_info "$MODULE" "$(printf '✔  COMPLETE\n─────────────────────────────────────\nInstalled %d file(s) into:\n  %s\n\n%s\nWine'"'"'s originals were kept as <name>.wt_bak.' "$INSTALLED" "$WINEPREFIX" "$REPORT")"
 fi

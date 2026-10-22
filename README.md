@@ -10,7 +10,7 @@ build on, usable entirely on their own.
 | Tool | What it is |
 |------|-----------|
 | [mythix-loader](mythix-loader/README.md) | Launch Steam games you own from a portable profile (stub exe + ini) outside the game folder. Includes a Python profile manager and 32/64-bit loader stubs. |
-| [mythix-winetoolz](mythix-winetoolz/README.md) | Zenity-driven Wine prefix toolkit: DXVK/VKD3D/NVAPI installers, runtime installers (.NET, VC++, DirectX), prefix create/manage/diagnose, env-flag profiles, log capture. |
+| [mythix-winetoolz](mythix-winetoolz/README.md) | Zenity-driven Wine prefix toolkit: DXVK/VKD3D/NVAPI installers, runtime installers (.NET, VC++, DirectX) with verified downloads, GE-Proton/Kron4ek downloads, prefix create/manage/backup/diagnose, DLL overrides, app shortcuts, env-flag profiles, log capture. |
 | [mythix-system-manager](mythix-system-manager/README.md) | GTK3 desktop system manager for Linux Mint and Debian: updates, packages, kernels, repos, security, logs — with a command palette and update notifier. |
 
 ## License

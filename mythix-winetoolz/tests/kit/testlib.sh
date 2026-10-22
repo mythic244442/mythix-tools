@@ -18,7 +18,7 @@ source "$TESTLIB_DIR/harness.sh"
 LIB="$WT_ROOT/modules/winetoolz-lib.sh"
 FILTER="${FILTER:-}"
 
-PASS=0 FAIL=0
+PASS=0 FAIL=0 SKIP=0
 declare -a FAILED=()
 
 fail() { printf '    FAIL: %s\n' "$*" >&2; return 1; }
@@ -43,6 +43,7 @@ run_test() {
     # Not inside an && / || list: bash would silently ignore the tests'
     # `set -e` there, and a failed assertion would not stop the test.
     out="$(
+        exec 2>&1
         wt_kit_setup
         trap 'wt_kit_teardown' EXIT
         export WT_ASSUME_GUI=1 WT_TERMINAL=xterm
@@ -51,9 +52,12 @@ run_test() {
         source "$LIB"
         "$name"
         wt_kit_markup_ok
-    ) 2>&1"
+    )"
     rc=$?
-    if (( rc == 0 )); then
+    if (( rc == 0 )) && [[ "$out" == *"(skipped"* ]]; then
+        SKIP=$((SKIP + 1))
+        printf '  skip  %s %s\n' "$name" "$(grep -o '(skipped[^)]*)' <<< "$out" | head -1)"
+    elif (( rc == 0 )); then
         PASS=$((PASS + 1))
         printf '  ok    %s\n' "$name"
     else
@@ -319,7 +323,7 @@ run_all_tests() {
     mapfile -t all < <(declare -F | awk '{print $3}' | grep '^test_')
     printf '%s\n' "$title"
     for t in "${all[@]}"; do run_test "$t"; done
-    printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+    printf '\n%d passed, %d failed%s\n' "$PASS" "$FAIL" "$( (( SKIP )) && printf ', %d skipped' "$SKIP")"
     if (( FAIL )); then
         printf 'failed: %s\n' "${FAILED[*]}"
         exit 1
