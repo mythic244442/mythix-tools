@@ -17,4 +17,4 @@ build on, usable entirely on their own.
 
 GPL-2.0 — see [LICENSE](LICENSE).
 
-Built by **Luna** and the Mythix team.
+Built by Mythix with steel, grit, and hard work beyond measure
