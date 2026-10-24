@@ -1,1 +1,0 @@
-"""Mythix System Manager package."""
